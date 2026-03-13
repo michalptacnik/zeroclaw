@@ -341,6 +341,13 @@ fn push_failure(
 // error message gives operators a complete diagnostic trail.
 
 /// Provider wrapper with retry, fallback, auth rotation, and model failover.
+/// Per-provider failure state for the provider-level circuit breaker.
+#[derive(Debug)]
+struct ProviderFailureState {
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
@@ -352,6 +359,12 @@ pub struct ReliableProvider {
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Temporarily deprioritized models after repeated 429s.
     model_cooldowns: Mutex<HashMap<String, Instant>>,
+    /// Per-provider circuit breaker state.
+    provider_failures: Mutex<HashMap<String, ProviderFailureState>>,
+    /// Consecutive failures to trip the provider circuit breaker (0 = disabled).
+    provider_circuit_breaker_threshold: u32,
+    /// Minutes the circuit breaker stays open after being tripped.
+    provider_circuit_breaker_cooldown_mins: u64,
 }
 
 impl ReliableProvider {
@@ -368,7 +381,17 @@ impl ReliableProvider {
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
             model_cooldowns: Mutex::new(HashMap::new()),
+            provider_failures: Mutex::new(HashMap::new()),
+            provider_circuit_breaker_threshold: 5,
+            provider_circuit_breaker_cooldown_mins: 5,
         }
+    }
+
+    /// Set provider circuit breaker configuration.
+    pub fn with_circuit_breaker(mut self, threshold: u32, cooldown_mins: u64) -> Self {
+        self.provider_circuit_breaker_threshold = threshold;
+        self.provider_circuit_breaker_cooldown_mins = cooldown_mins;
+        self
     }
 
     /// Set additional API keys for round-robin rotation on rate-limit errors.
@@ -430,6 +453,60 @@ impl ReliableProvider {
         Some(&self.api_keys[idx])
     }
 
+    /// Returns `true` if the provider's circuit breaker is currently open
+    /// (i.e. the provider is cooling down and should be skipped).
+    fn is_provider_circuit_open(&self, provider_name: &str) -> bool {
+        if self.provider_circuit_breaker_threshold == 0 {
+            return false;
+        }
+        let failures = self.provider_failures.lock();
+        if let Some(state) = failures.get(provider_name) {
+            if state.consecutive_failures >= self.provider_circuit_breaker_threshold {
+                if let Some(until) = state.cooldown_until {
+                    if Instant::now() < until {
+                        return true; // Still cooling down.
+                    }
+                    // Cooldown expired — circuit half-open; allow one attempt.
+                }
+            }
+        }
+        false
+    }
+
+    /// Record a successful call to a provider.  Resets the failure state.
+    fn record_provider_success(&self, provider_name: &str) {
+        let mut failures = self.provider_failures.lock();
+        failures.remove(provider_name);
+    }
+
+    /// Record a failed call to a provider.  If the failure count reaches the
+    /// threshold, the circuit breaker is tripped and a cooldown is set.
+    fn record_provider_failure(&self, provider_name: &str) {
+        if self.provider_circuit_breaker_threshold == 0 {
+            return;
+        }
+        let mut failures = self.provider_failures.lock();
+        let state = failures
+            .entry(provider_name.to_string())
+            .or_insert(ProviderFailureState {
+                consecutive_failures: 0,
+                cooldown_until: None,
+            });
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.provider_circuit_breaker_threshold {
+            let cooldown_ms = self.provider_circuit_breaker_cooldown_mins * 60 * 1_000;
+            let until = Instant::now() + Duration::from_millis(cooldown_ms);
+            state.cooldown_until = Some(until);
+            tracing::warn!(
+                provider = provider_name,
+                consecutive_failures = state.consecutive_failures,
+                threshold = self.provider_circuit_breaker_threshold,
+                cooldown_mins = self.provider_circuit_breaker_cooldown_mins,
+                "Provider circuit breaker tripped — provider will be skipped until cooldown expires"
+            );
+        }
+    }
+
     /// Compute backoff duration, respecting Retry-After if present.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
         let capped = if let Some(retry_after) = parse_retry_after_ms(err) {
@@ -473,6 +550,24 @@ impl Provider for ReliableProvider {
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Provider-level circuit breaker: skip cooling-down providers.
+                if self.is_provider_circuit_open(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        "Skipping provider — circuit breaker open (cooling down)"
+                    );
+                    push_failure(
+                        &mut failures,
+                        provider_name,
+                        current_model,
+                        0,
+                        self.max_retries + 1,
+                        "circuit_open",
+                        "provider circuit breaker is open",
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut rate_limit_failures = 0u32;
 
@@ -498,6 +593,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.record_provider_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -585,6 +681,10 @@ impl Provider for ReliableProvider {
                     self.note_rate_limit_cooldown(current_model);
                 }
 
+                // Record provider-level failure for the circuit breaker.
+                // We only reach here if all retries were exhausted without success.
+                self.record_provider_failure(provider_name);
+
                 tracing::warn!(
                     provider = provider_name,
                     model = *current_model,
@@ -618,6 +718,24 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                // Provider-level circuit breaker.
+                if self.is_provider_circuit_open(provider_name) {
+                    tracing::warn!(
+                        provider = provider_name,
+                        "Skipping provider — circuit breaker open (cooling down)"
+                    );
+                    push_failure(
+                        &mut failures,
+                        provider_name,
+                        current_model,
+                        0,
+                        self.max_retries + 1,
+                        "circuit_open",
+                        "provider circuit breaker is open",
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
                 let mut rate_limit_failures = 0u32;
 
@@ -643,6 +761,7 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
+                            self.record_provider_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -727,6 +846,9 @@ impl Provider for ReliableProvider {
                 if rate_limit_failures >= 2 {
                     self.note_rate_limit_cooldown(current_model);
                 }
+
+                // Record provider-level failure — we only reach here if all retries failed.
+                self.record_provider_failure(provider_name);
 
                 tracing::warn!(
                     provider = provider_name,

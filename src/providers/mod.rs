@@ -1424,7 +1424,11 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_circuit_breaker(
+        reliability.provider_circuit_breaker_threshold,
+        reliability.provider_circuit_breaker_cooldown_mins,
+    );
 
     Ok(Box::new(reliable))
 }
