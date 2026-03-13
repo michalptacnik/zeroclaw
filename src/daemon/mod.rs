@@ -1,3 +1,5 @@
+pub mod pid;
+
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
@@ -37,6 +39,14 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Acquire PID file to prevent concurrent daemon instances.
+    let pid_path = config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("zeroclaw.pid");
+    let _pid_guard = pid::PidFileGuard::acquire(pid_path).await?;
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
