@@ -477,6 +477,7 @@ impl ReliableProvider {
     fn record_provider_success(&self, provider_name: &str) {
         let mut failures = self.provider_failures.lock();
         failures.remove(provider_name);
+        crate::health::mark_provider_ok(provider_name);
     }
 
     /// Record a failed call to a provider.  If the failure count reaches the
@@ -493,17 +494,27 @@ impl ReliableProvider {
                 cooldown_until: None,
             });
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        if state.consecutive_failures >= self.provider_circuit_breaker_threshold {
+        let consecutive = state.consecutive_failures;
+        if consecutive >= self.provider_circuit_breaker_threshold {
             let cooldown_ms = self.provider_circuit_breaker_cooldown_mins * 60 * 1_000;
             let until = Instant::now() + Duration::from_millis(cooldown_ms);
             state.cooldown_until = Some(until);
+
+            // Compute RFC3339 cooldown timestamp for the health registry.
+            let until_rfc3339 = (chrono::Utc::now()
+                + chrono::Duration::milliseconds(cooldown_ms as i64))
+            .to_rfc3339();
+            crate::health::mark_provider_cooling(provider_name, &until_rfc3339, consecutive);
+
             tracing::warn!(
                 provider = provider_name,
-                consecutive_failures = state.consecutive_failures,
+                consecutive_failures = consecutive,
                 threshold = self.provider_circuit_breaker_threshold,
                 cooldown_mins = self.provider_circuit_breaker_cooldown_mins,
                 "Provider circuit breaker tripped — provider will be skipped until cooldown expires"
             );
+        } else {
+            crate::health::mark_provider_failure(provider_name, consecutive);
         }
     }
 
