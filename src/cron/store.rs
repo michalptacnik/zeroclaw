@@ -360,11 +360,7 @@ pub fn record_run(
 /// [`complete_run`] when the job finishes.  The `finished_at` is stored as
 /// the same value as `started_at` (a placeholder) and is overwritten by
 /// `complete_run`.
-pub fn insert_running_run(
-    config: &Config,
-    job_id: &str,
-    started_at: DateTime<Utc>,
-) -> Result<i64> {
+pub fn insert_running_run(config: &Config, job_id: &str, started_at: DateTime<Utc>) -> Result<i64> {
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
@@ -430,13 +426,10 @@ pub fn complete_run(
 /// were in-flight when the daemon last exited without a clean shutdown.
 ///
 /// Each entry is `(run_id, job_id, started_at)`.
-pub fn sweep_interrupted_runs(
-    config: &Config,
-) -> Result<Vec<(i64, String, DateTime<Utc>)>> {
+pub fn sweep_interrupted_runs(config: &Config) -> Result<Vec<(i64, String, DateTime<Utc>)>> {
     with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, job_id, started_at FROM cron_runs WHERE status = 'running'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, job_id, started_at FROM cron_runs WHERE status = 'running'")?;
         let rows = stmt.query_map([], |row| {
             let run_id: i64 = row.get(0)?;
             let job_id: String = row.get(1)?;
@@ -454,7 +447,11 @@ pub fn sweep_interrupted_runs(
 
 /// Mark an interrupted run (status = 'running') as having been cut short by a
 /// daemon restart, so it no longer blocks missed-job detection.
-pub fn mark_run_interrupted(config: &Config, run_id: i64, finished_at: DateTime<Utc>) -> Result<()> {
+pub fn mark_run_interrupted(
+    config: &Config,
+    run_id: i64,
+    finished_at: DateTime<Utc>,
+) -> Result<()> {
     with_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_runs SET finished_at = ?1, status = 'interrupted' WHERE id = ?2",

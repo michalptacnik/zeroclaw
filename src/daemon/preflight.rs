@@ -10,11 +10,19 @@ struct CheckResult {
 
 impl CheckResult {
     fn ok(name: &'static str) -> Self {
-        Self { name, ok: true, message: String::new() }
+        Self {
+            name,
+            ok: true,
+            message: String::new(),
+        }
     }
 
     fn warn(name: &'static str, message: impl Into<String>) -> Self {
-        Self { name, ok: false, message: message.into() }
+        Self {
+            name,
+            ok: false,
+            message: message.into(),
+        }
     }
 }
 
@@ -77,7 +85,11 @@ fn check_api_key_present(config: &Config) -> CheckResult {
         .or_else(|| std::env::var("API_KEY").ok().filter(|k| !k.is_empty()));
 
     if env_key.is_some()
-        || config.api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false)
+        || config
+            .api_key
+            .as_deref()
+            .map(|k| !k.is_empty())
+            .unwrap_or(false)
         || !config.model_providers.is_empty()
     {
         CheckResult::ok("api_key_present")
