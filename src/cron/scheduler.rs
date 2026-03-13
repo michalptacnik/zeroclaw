@@ -3,7 +3,8 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
+    complete_run, due_jobs, insert_running_run, mark_run_interrupted, next_run_for_schedule,
+    record_last_run, record_run, remove_job, reschedule_after_run, sweep_interrupted_runs,
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
@@ -128,10 +129,32 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
+
+    // Record a "running" sentinel so we can detect interrupted jobs on next
+    // daemon startup.  Failure to record is non-fatal.
+    let run_id = insert_running_run(config, &job.id, started_at)
+        .map_err(|e| tracing::warn!("Failed to insert running run for '{}': {e}", job.id))
+        .ok();
+
     let (success, output) = execute_job_with_retry(config, security, job).await;
     let finished_at = Utc::now();
-    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+    let duration_ms = (finished_at - started_at).num_milliseconds();
 
+    // Complete the running sentinel (or fall back to the legacy record_run path).
+    if let Some(rid) = run_id {
+        let status = if success { "ok" } else { "error" };
+        if let Err(e) = complete_run(config, rid, &job.id, finished_at, status, Some(&output), duration_ms) {
+            tracing::warn!("Failed to complete run record for '{}': {e}", job.id);
+            // Fallback: use legacy path so history is not lost entirely.
+            let _ = record_run(config, &job.id, started_at, finished_at, status, Some(&output), duration_ms);
+        }
+    } else {
+        // insert_running_run failed — fall back to legacy record_run.
+        let status = if success { "ok" } else { "error" };
+        let _ = record_run(config, &job.id, started_at, finished_at, status, Some(&output), duration_ms);
+    }
+
+    let success = persist_job_result_no_record(config, job, success, &output, started_at, finished_at).await;
     (job.id.clone(), success, output)
 }
 
@@ -221,6 +244,54 @@ async fn persist_job_result(
         Some(output),
         duration_ms,
     );
+
+    if is_one_shot_auto_delete(job) {
+        if success {
+            if let Err(e) = remove_job(config, &job.id) {
+                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
+            }
+        } else {
+            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            if let Err(e) = update_job(
+                config,
+                &job.id,
+                CronJobPatch {
+                    enabled: Some(false),
+                    ..CronJobPatch::default()
+                },
+            ) {
+                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+            }
+        }
+        return success;
+    }
+
+    if let Err(e) = reschedule_after_run(config, job, success, output) {
+        tracing::warn!("Failed to persist scheduler run result: {e}");
+    }
+
+    success
+}
+
+/// Like [`persist_job_result`] but does NOT call `record_run` — used when the
+/// run row was already inserted/updated by the `insert_running_run` /
+/// `complete_run` path.
+async fn persist_job_result_no_record(
+    config: &Config,
+    job: &CronJob,
+    mut success: bool,
+    output: &str,
+    _started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+) -> bool {
+    if let Err(e) = deliver_if_configured(config, job, output).await {
+        if job.delivery.best_effort {
+            tracing::warn!("Cron delivery failed (best_effort): {e}");
+        } else {
+            success = false;
+            tracing::warn!("Cron delivery failed: {e}");
+        }
+    }
 
     if is_one_shot_auto_delete(job) {
         if success {
