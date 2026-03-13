@@ -16,6 +16,7 @@ pub struct ToolExecutionResult {
     pub output: String,
     pub success: bool,
     pub tool_call_id: Option<String>,
+    pub proof: Option<crate::agent::proof::ProofSignal>,
 }
 
 pub trait ToolDispatcher: Send + Sync {
@@ -338,6 +339,7 @@ mod tests {
             output: "hello".into(),
             success: true,
             tool_call_id: Some("tc1".into()),
+            proof: None,
         }]);
         match msg {
             ConversationMessage::ToolResults(results) => {
@@ -356,6 +358,7 @@ mod tests {
             output: "ok".into(),
             success: true,
             tool_call_id: None,
+            proof: None,
         }]);
         let rendered = match msg {
             ConversationMessage::Chat(chat) => chat.content,
@@ -373,6 +376,7 @@ mod tests {
             output: "ok".into(),
             success: true,
             tool_call_id: Some("tc-1".into()),
+            proof: None,
         }]);
 
         match msg {

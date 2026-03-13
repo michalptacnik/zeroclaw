@@ -291,6 +291,8 @@ struct ChannelRuntimeContext {
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
+    query_classification: crate::config::QueryClassificationConfig,
+    planner_execution: crate::config::PlannerExecutionConfig,
 }
 
 #[derive(Clone)]
@@ -853,6 +855,161 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
     }
 }
 
+fn route_selection_for_hint(
+    model_routes: &[crate::config::ModelRouteConfig],
+    hint: &str,
+) -> Option<ChannelRouteSelection> {
+    model_routes.iter().find_map(|route| {
+        route
+            .hint
+            .eq_ignore_ascii_case(hint)
+            .then(|| ChannelRouteSelection {
+                provider: route.provider.clone(),
+                model: route.model.clone(),
+            })
+    })
+}
+
+async fn plan_channel_execution(
+    ctx: &ChannelRuntimeContext,
+    active_route: &ChannelRouteSelection,
+    history: &[ChatMessage],
+    user_message: &str,
+) -> (ChannelRouteSelection, Option<String>, Option<String>) {
+    let fallback_route = active_route.clone();
+    let planner_cfg = &ctx.planner_execution;
+
+    if !planner_cfg.enabled {
+        return (fallback_route, None, None);
+    }
+
+    if let Some(decision) =
+        crate::agent::classifier::classify_with_decision(&ctx.query_classification, user_message)
+    {
+        if planner_cfg
+            .simple_hints
+            .iter()
+            .any(|hint| hint.eq_ignore_ascii_case(&decision.hint))
+        {
+            let route = route_selection_for_hint(&ctx.model_routes, &planner_cfg.executor_hint)
+                .unwrap_or_else(|| fallback_route.clone());
+            runtime_trace::record_event(
+                "planner_path_selected",
+                None,
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(true),
+                None,
+                serde_json::json!({
+                    "path": "simple_executor",
+                    "matched_hint": decision.hint,
+                }),
+            );
+            return (route, None, None);
+        }
+    }
+
+    if crate::agent::classifier::classify(&planner_cfg.external_action_classification, user_message)
+        .is_none()
+    {
+        runtime_trace::record_event(
+            "planner_path_selected",
+            None,
+            Some(active_route.provider.as_str()),
+            Some(active_route.model.as_str()),
+            None,
+            Some(true),
+            None,
+            serde_json::json!({
+                "path": "default_executor",
+            }),
+        );
+        return (fallback_route, None, None);
+    }
+
+    let Some(planner_route) =
+        route_selection_for_hint(&ctx.model_routes, &planner_cfg.planner_hint)
+    else {
+        let route = route_selection_for_hint(&ctx.model_routes, &planner_cfg.executor_hint)
+            .unwrap_or_else(|| fallback_route.clone());
+        runtime_trace::record_event(
+            "planner_path_selected",
+            None,
+            Some(route.provider.as_str()),
+            Some(route.model.as_str()),
+            None,
+            Some(false),
+            Some("planner route missing"),
+            serde_json::json!({
+                "path": "planner_fallback",
+            }),
+        );
+        return (route, None, None);
+    };
+
+    let planner_provider = match get_or_create_provider(ctx, &planner_route.provider).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::warn!(error = %error, "planner provider init failed; using executor fallback");
+            let route = route_selection_for_hint(&ctx.model_routes, &planner_cfg.executor_hint)
+                .unwrap_or_else(|| fallback_route.clone());
+            return (route, None, None);
+        }
+    };
+
+    let available_hints: HashSet<String> = ctx
+        .model_routes
+        .iter()
+        .map(|route| route.hint.clone())
+        .collect();
+    let planning = match crate::agent::planner::plan_execution(
+        planner_provider.as_ref(),
+        history,
+        user_message,
+        &fallback_route.model,
+        &ctx.query_classification,
+        planner_cfg,
+        &available_hints,
+        ctx.temperature,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(error = %error, "planner execution failed; using executor fallback");
+            let route = route_selection_for_hint(&ctx.model_routes, &planner_cfg.executor_hint)
+                .unwrap_or_else(|| fallback_route.clone());
+            return (route, None, None);
+        }
+    };
+
+    let route = planning
+        .effective_model
+        .strip_prefix("hint:")
+        .and_then(|hint| route_selection_for_hint(&ctx.model_routes, hint))
+        .unwrap_or_else(|| fallback_route.clone());
+    runtime_trace::record_event(
+        "planner_path_selected",
+        None,
+        Some(route.provider.as_str()),
+        Some(route.model.as_str()),
+        None,
+        Some(true),
+        None,
+        serde_json::json!({
+            "path": format!("{:?}", planning.path),
+            "visible_summary": planning.visible_summary,
+        }),
+    );
+
+    (
+        route,
+        planning.visible_summary,
+        planning.extra_system_context,
+    )
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
@@ -1246,7 +1403,9 @@ async fn build_memory_context(
             }
 
             if included == 0 {
-                context.push_str("[Memory context]\n");
+                context.push_str(
+                    "[Memory context - background only, never proof of current-task completion]\n",
+                );
             }
 
             context.push_str(&line);
@@ -1694,25 +1853,6 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
-        Ok(provider) => provider,
-        Err(err) => {
-            let safe_err = providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
-            }
-            return;
-        }
-    };
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1736,8 +1876,18 @@ async fn process_channel_message(
         .get(&history_key)
         .is_some_and(|turns| !turns.is_empty());
 
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let attempt_scoped_content = format!(
+        "[Attempt ID: {attempt_id}]\n[Current-attempt proof only. Prior conversation and memory are context, not proof.]\n{}",
+        msg.content
+    );
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&attempt_scoped_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -1756,7 +1906,7 @@ async fn process_channel_message(
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+                last_turn.content = format!("{memory_context}{attempt_scoped_content}");
             }
         }
     }
@@ -1765,6 +1915,29 @@ async fn process_channel_message(
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    let (effective_route, planner_summary, extra_system_context) =
+        plan_channel_execution(ctx.as_ref(), &route, &history, &msg.content).await;
+    let active_provider = match get_or_create_provider(ctx.as_ref(), &effective_route.provider)
+        .await
+    {
+        Ok(provider) => provider,
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            let message = format!(
+                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                effective_route.provider
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        }
+    };
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -1832,6 +2005,19 @@ async fn process_channel_message(
     } else {
         None
     };
+
+    if let Some(summary) = planner_summary.as_deref() {
+        if let Some(ref tx) = delta_tx {
+            let _ = tx.send(format!("📋 {summary}\n")).await;
+        } else if let Some(channel) = target_channel.as_ref() {
+            let _ = channel
+                .send(
+                    &SendMessage::new(format!("📋 {summary}"), &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+        }
+    }
 
     // React with 👀 to acknowledge the incoming message
     if let Some(channel) = target_channel.as_ref() {
@@ -1903,8 +2089,8 @@ async fn process_channel_message(
                 &mut history,
                 ctx.tools_registry.as_ref(),
                 notify_observer.as_ref() as &dyn Observer,
-                route.provider.as_str(),
-                route.model.as_str(),
+                effective_route.provider.as_str(),
+                effective_route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
                 None,
@@ -1913,6 +2099,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                extra_system_context.as_deref(),
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli" {
                     &[]
@@ -1960,8 +2147,8 @@ async fn process_channel_message(
             runtime_trace::record_event(
                 "channel_message_cancelled",
                 Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
+                Some(effective_route.provider.as_str()),
+                Some(effective_route.model.as_str()),
                 None,
                 Some(false),
                 Some("cancelled due to newer inbound message"),
@@ -2049,8 +2236,8 @@ async fn process_channel_message(
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
+                Some(effective_route.provider.as_str()),
+                Some(effective_route.model.as_str()),
                 None,
                 Some(true),
                 None,
@@ -2117,8 +2304,8 @@ async fn process_channel_message(
                 runtime_trace::record_event(
                     "channel_message_cancelled",
                     Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
+                    Some(effective_route.provider.as_str()),
+                    Some(effective_route.model.as_str()),
                     None,
                     Some(false),
                     Some("cancelled during tool-call loop"),
@@ -2149,8 +2336,8 @@ async fn process_channel_message(
                 runtime_trace::record_event(
                     "channel_message_error",
                     Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
+                    Some(effective_route.provider.as_str()),
+                    Some(effective_route.model.as_str()),
                     None,
                     Some(false),
                     Some("context window exceeded"),
@@ -2183,8 +2370,8 @@ async fn process_channel_message(
                 runtime_trace::record_event(
                     "channel_message_error",
                     Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
+                    Some(effective_route.provider.as_str()),
+                    Some(effective_route.model.as_str()),
                     None,
                     Some(false),
                     Some(&safe_error),
@@ -2197,7 +2384,11 @@ async fn process_channel_message(
                     .downcast_ref::<providers::ProviderCapabilityError>()
                     .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        &attempt_scoped_content,
+                    );
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -2232,8 +2423,8 @@ async fn process_channel_message(
             runtime_trace::record_event(
                 "channel_message_timeout",
                 Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
+                Some(effective_route.provider.as_str()),
+                Some(effective_route.model.as_str()),
                 None,
                 Some(false),
                 Some(&timeout_msg),
@@ -3515,6 +3706,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         model_routes: Arc::new(config.model_routes.clone()),
+        query_classification: config.query_classification.clone(),
+        planner_execution: config.planner_execution.clone(),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3729,6 +3922,8 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3779,6 +3974,8 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3832,6 +4029,8 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4308,6 +4507,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4369,6 +4570,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4444,6 +4647,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4504,6 +4709,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4574,6 +4781,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4664,6 +4873,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4736,6 +4947,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4823,6 +5036,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4895,6 +5110,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -4957,6 +5174,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -5130,6 +5349,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -5211,6 +5432,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5304,6 +5527,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5379,6 +5604,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -5439,6 +5666,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -5915,7 +6144,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
 
         let context = build_memory_context(&mem, "age", 0.0).await;
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[Memory context"));
         assert!(context.contains("Age is 45"));
     }
 
@@ -5956,6 +6185,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -6042,6 +6273,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -6066,7 +6299,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
+        assert!(calls[0][1].1.contains("[Memory context"));
         assert!(calls[0][1].1.contains("Age is 45"));
         assert!(calls[0][1].1.contains("hello"));
 
@@ -6078,8 +6311,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
-        assert!(!turns[0].content.contains("[Memory context]"));
+        assert!(
+            turns[0].content.ends_with("hello"),
+            "persisted user turn should end with raw message, got: {}",
+            turns[0].content
+        );
+        assert!(!turns[0].content.contains("[Memory context"));
     }
 
     #[tokio::test]
@@ -6128,6 +6365,8 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -6678,6 +6917,8 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6745,6 +6986,8 @@ This is an example JSON object for profile settings."#;
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            planner_execution: crate::config::PlannerExecutionConfig::default(),
         });
 
         process_channel_message(
@@ -6800,7 +7043,11 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(
+            turns[0].content.ends_with("What is WAL?"),
+            "user turn should end with raw message, got: {}",
+            turns[0].content
+        );
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(

@@ -1,3 +1,5 @@
+use crate::agent::planner;
+use crate::agent::proof::{extract_proof_signal, render_terminal_success_message, ProofSignal};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -110,6 +112,10 @@ const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+
+/// Hard cap on any single tool result before it enters conversation history.
+/// Prevents runaway DOM dumps or API responses from blowing the context window.
+const MAX_TOOL_RESULT_CHARS: usize = 16_000;
 
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
@@ -1692,6 +1698,58 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Bare `TOOLCALL>` / `TOOL_CALL>` prefix followed by JSON.
+    // Some free-tier models (OpenRouter/Qwen) emit tool calls as:
+    //   TOOLCALL>[{"name":"mail","arguments":{...}}]
+    // or:
+    //   TOOLCALL>{"name":"mail","arguments":{...}}
+    // This is an intentional tool-call emission format (distinct from
+    // arbitrary JSON in content) because the prefix is model-generated
+    // and unambiguous.
+    if calls.is_empty() {
+        static TOOLCALL_PREFIX_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)(?:^|\n)\s*TOOL[_\s]?CALL\s*>\s*").unwrap());
+        if let Some(m) = TOOLCALL_PREFIX_RE.find(response) {
+            let before = &response[..m.start()];
+            let after = &response[m.end()..];
+
+            // Try to parse the JSON after the prefix
+            let json_values = extract_json_values(after);
+            for value in &json_values {
+                // Could be an array of calls or a single call object
+                if let Some(arr) = value.as_array() {
+                    for item in arr {
+                        let parsed = parse_tool_calls_from_json_value(item);
+                        if parsed.is_empty() {
+                            // Try as a direct {name, arguments} object
+                            if let Some(call) = parse_tool_call_value(item) {
+                                calls.push(call);
+                            }
+                        } else {
+                            calls.extend(parsed);
+                        }
+                    }
+                } else {
+                    let parsed = parse_tool_calls_from_json_value(value);
+                    if parsed.is_empty() {
+                        if let Some(call) = parse_tool_call_value(value) {
+                            calls.push(call);
+                        }
+                    } else {
+                        calls.extend(parsed);
+                    }
+                }
+            }
+
+            if !calls.is_empty() {
+                if !before.trim().is_empty() {
+                    text_parts.push(before.trim().to_string());
+                }
+                remaining = "";
+            }
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -1700,6 +1758,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
+    // 5. TOOLCALL> prefixed JSON (model-emitted intent marker)
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -1965,6 +2024,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
+        None,
         &[],
     )
     .await
@@ -2004,6 +2064,7 @@ async fn execute_one_tool(
             success: false,
             error_reason: Some(scrub_credentials(&reason)),
             duration,
+            proof: None,
         });
     };
 
@@ -2031,6 +2092,7 @@ async fn execute_one_tool(
                     success: true,
                     error_reason: None,
                     duration,
+                    proof: extract_proof_signal(&r.output),
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
@@ -2039,6 +2101,7 @@ async fn execute_one_tool(
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
                     duration,
+                    proof: None,
                 })
             }
         }
@@ -2055,6 +2118,7 @@ async fn execute_one_tool(
                 success: false,
                 error_reason: Some(scrub_credentials(&reason)),
                 duration,
+                proof: None,
             })
         }
     }
@@ -2065,6 +2129,7 @@ struct ToolExecutionOutcome {
     success: bool,
     error_reason: Option<String>,
     duration: Duration,
+    proof: Option<ProofSignal>,
 }
 
 fn should_execute_tools_in_parallel(
@@ -2163,6 +2228,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    extra_system_context: Option<&str>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
 ) -> Result<String> {
@@ -2203,6 +2269,14 @@ pub(crate) async fn run_tool_call_loop(
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let mut request_messages = prepared_messages.messages;
+        if let Some(extra_system_context) = extra_system_context {
+            let insert_at = request_messages
+                .iter()
+                .take_while(|message| message.role == "system")
+                .count();
+            request_messages.insert(insert_at, ChatMessage::system(extra_system_context));
+        }
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2250,7 +2324,7 @@ pub(crate) async fn run_tool_call_loop(
 
         let chat_future = provider.chat(
             ChatRequest {
-                messages: &prepared_messages.messages,
+                messages: &request_messages,
                 tools: request_tools,
             },
             model,
@@ -2514,6 +2588,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
+                                proof: None,
                             },
                         ));
                         continue;
@@ -2566,6 +2641,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(denied),
                                 duration: Duration::ZERO,
+                                proof: None,
                             },
                         ));
                         continue;
@@ -2601,6 +2677,7 @@ pub(crate) async fn run_tool_call_loop(
                         success: false,
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
+                        proof: None,
                     },
                 ));
                 continue;
@@ -2707,12 +2784,33 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        let terminal_proof = ordered_results.iter().find_map(|entry| {
+            entry
+                .as_ref()
+                .and_then(|(_, _, outcome)| outcome.proof.as_ref())
+                .cloned()
+        });
+
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let mut result_text = outcome.output.clone();
+            if result_text.len() > MAX_TOOL_RESULT_CHARS {
+                let mut boundary = MAX_TOOL_RESULT_CHARS.saturating_sub(80);
+                while boundary > 0 && !result_text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                result_text.truncate(boundary);
+                result_text.push_str("\n\n[... tool output truncated — exceeded 16 000 chars]");
+                tracing::warn!(
+                    tool = %tool_name,
+                    original_len = outcome.output.len(),
+                    "Tool result truncated to prevent context-window overflow"
+                );
+            }
+            individual_results.push((tool_call_id, result_text.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, result_text
             );
         }
 
@@ -2748,6 +2846,31 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        if let Some(proof) = terminal_proof.as_ref() {
+            let final_text = render_terminal_success_message(proof);
+            runtime_trace::record_event(
+                "turn_terminal_proof",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(true),
+                None,
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "proof_summary": proof.summary,
+                    "artifact_id": proof.artifact_id,
+                    "attempt_id": proof.attempt_id,
+                }),
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                let _ = tx.send(final_text.clone()).await;
+            }
+            history.push(ChatMessage::assistant(final_text.clone()));
+            return Ok(final_text);
         }
     }
 
@@ -3064,6 +3187,11 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+    let available_hints: HashSet<String> = config
+        .model_routes
+        .iter()
+        .map(|route| route.hint.clone())
+        .collect();
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -3089,10 +3217,26 @@ pub async fn run(
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let attempt_id = Uuid::new_v4().to_string();
+        let planning = planner::plan_execution(
+            provider.as_ref(),
+            &[ChatMessage::system(&system_prompt)],
+            &msg,
+            model_name,
+            &config.query_classification,
+            &config.planner_execution,
+            &available_hints,
+            temperature,
+        )
+        .await?;
         let enriched = if context.is_empty() {
-            format!("[{now}] {msg}")
+            format!(
+                "[Attempt ID: {attempt_id}]\n[Current-attempt proof only. Prior history and memory are context, not proof.]\n[{now}] {msg}"
+            )
         } else {
-            format!("{context}[{now}] {msg}")
+            format!(
+                "{context}[Attempt ID: {attempt_id}]\n[Current-attempt proof only. Prior history and memory are context, not proof.]\n[{now}] {msg}"
+            )
         };
 
         let mut history = vec![
@@ -3106,7 +3250,7 @@ pub async fn run(
             &tools_registry,
             observer.as_ref(),
             provider_name,
-            model_name,
+            &planning.effective_model,
             temperature,
             false,
             approval_manager.as_ref(),
@@ -3115,6 +3259,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            planning.extra_system_context.as_deref(),
             None,
             &[],
         )
@@ -3214,13 +3359,40 @@ pub async fn run(
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let attempt_id = Uuid::new_v4().to_string();
+            let planning = match planner::plan_execution(
+                provider.as_ref(),
+                &history,
+                &user_input,
+                model_name,
+                &config.query_classification,
+                &config.planner_execution,
+                &available_hints,
+                temperature,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("\nError: {error}\n");
+                    continue;
+                }
+            };
             let enriched = if context.is_empty() {
-                format!("[{now}] {user_input}")
+                format!(
+                    "[Attempt ID: {attempt_id}]\n[Current-attempt proof only. Prior history and memory are context, not proof.]\n[{now}] {user_input}"
+                )
             } else {
-                format!("{context}[{now}] {user_input}")
+                format!(
+                    "{context}[Attempt ID: {attempt_id}]\n[Current-attempt proof only. Prior history and memory are context, not proof.]\n[{now}] {user_input}"
+                )
             };
 
             history.push(ChatMessage::user(&enriched));
+
+            if let Some(summary) = planning.visible_summary.as_deref() {
+                println!("📋 {summary}");
+            }
 
             let response = match run_tool_call_loop(
                 provider.as_ref(),
@@ -3228,7 +3400,7 @@ pub async fn run(
                 &tools_registry,
                 observer.as_ref(),
                 provider_name,
-                model_name,
+                &planning.effective_model,
                 temperature,
                 false,
                 approval_manager.as_ref(),
@@ -3237,6 +3409,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 None,
+                planning.extra_system_context.as_deref(),
                 None,
                 &[],
             )
@@ -3782,6 +3955,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         )
         .await
@@ -3828,6 +4002,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         )
         .await
@@ -3865,6 +4040,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
             None,
@@ -3994,6 +4170,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         )
         .await
@@ -4063,6 +4240,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         )
         .await
@@ -4116,6 +4294,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None,
@@ -5767,6 +5946,46 @@ Let me check the result."#;
         // Tool names with special characters should be rejected
         assert!(parse_glm_shortened_body("not-a-tool>value").is_none());
         assert!(parse_glm_shortened_body("tool name>value").is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TOOLCALL> prefix format tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_calls_handles_toolcall_prefix_single() {
+        let input = r#"TOOLCALL>{"name":"mail","arguments":{"action":"send","recipient":"user@example.com","subject":"test","body":"hello"}}"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "should parse one tool call");
+        assert_eq!(calls[0].name, "mail");
+        assert_eq!(calls[0].arguments["action"], "send");
+        assert!(text.is_empty() || text.trim().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_toolcall_prefix_array() {
+        let input =
+            r#"TOOLCALL>[{"name":"mail","arguments":{"action":"send","recipient":"a@b.com"}}]"#;
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "should parse from JSON array");
+        assert_eq!(calls[0].name, "mail");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_toolcall_prefix_with_text_before() {
+        let input = "I'll send that email now.\nTOOLCALL>{\"name\":\"mail\",\"arguments\":{\"action\":\"send\"}}";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "mail");
+        assert!(text.contains("send that email"));
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_tool_call_prefix_with_underscore() {
+        let input = r#"TOOL_CALL>{"name":"shell","arguments":{"command":"ls"}}"#;
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
