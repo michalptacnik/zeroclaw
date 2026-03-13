@@ -7,6 +7,7 @@ use tokio::fs;
 /// silently overwritten.  If another ZeroClaw instance is already running
 /// (PID file exists and the process is alive) this constructor returns an
 /// error so the new daemon can abort cleanly.
+#[derive(Debug)]
 pub struct PidFileGuard {
     path: PathBuf,
 }
@@ -27,17 +28,15 @@ impl PidFileGuard {
                     );
                 }
                 // Stale file — fall through and overwrite.
-                tracing::warn!(
-                    "Removing stale PID file (pid {existing_pid} is no longer running)"
-                );
+                tracing::warn!("Removing stale PID file (pid {existing_pid} is no longer running)");
             }
         }
 
         // Ensure parent directory exists.
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create PID file directory: {}", parent.display()))?;
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create PID file directory: {}", parent.display())
+            })?;
         }
 
         let pid = std::process::id();
@@ -131,9 +130,6 @@ mod tests {
 
         let result = PidFileGuard::acquire(path.clone()).await;
         assert!(result.is_err(), "Should reject a live PID");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already running"));
+        assert!(result.unwrap_err().to_string().contains("already running"));
     }
 }

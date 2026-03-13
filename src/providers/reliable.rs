@@ -291,7 +291,7 @@ fn log_attempt_success(provider_name: &str, model: &str, attempt: u32, latency: 
         attempt,
         status_code = 200u16,
         error_category = "ok",
-        latency_ms = latency.as_millis() as u64,
+        latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
         "Provider attempt succeeded"
     );
 }
@@ -310,7 +310,7 @@ fn log_attempt_failure(
         attempt,
         status_code = ?status_code(err),
         error_category = error_category(err, non_retryable),
-        latency_ms = latency.as_millis() as u64,
+        latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
         error = %compact_error_detail(err),
         "Provider attempt failed"
     );

@@ -37,11 +37,7 @@ impl JobCircuitBreaker {
         if threshold == 0 {
             return false;
         }
-        self.consecutive_failures
-            .get(job_id)
-            .copied()
-            .unwrap_or(0)
-            >= threshold
+        self.consecutive_failures.get(job_id).copied().unwrap_or(0) >= threshold
     }
 
     /// Record a successful run — resets the failure counter.
@@ -97,8 +93,14 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &mut circuit_breaker)
-            .await;
+        process_due_jobs(
+            &config,
+            &security,
+            jobs,
+            SCHEDULER_COMPONENT,
+            &mut circuit_breaker,
+        )
+        .await;
     }
 }
 
@@ -231,18 +233,43 @@ async fn execute_and_persist_job(
     // Complete the running sentinel (or fall back to the legacy record_run path).
     if let Some(rid) = run_id {
         let status = if success { "ok" } else { "error" };
-        if let Err(e) = complete_run(config, rid, &job.id, finished_at, status, Some(&output), duration_ms) {
+        if let Err(e) = complete_run(
+            config,
+            rid,
+            &job.id,
+            finished_at,
+            status,
+            Some(&output),
+            duration_ms,
+        ) {
             tracing::warn!("Failed to complete run record for '{}': {e}", job.id);
             // Fallback: use legacy path so history is not lost entirely.
-            let _ = record_run(config, &job.id, started_at, finished_at, status, Some(&output), duration_ms);
+            let _ = record_run(
+                config,
+                &job.id,
+                started_at,
+                finished_at,
+                status,
+                Some(&output),
+                duration_ms,
+            );
         }
     } else {
         // insert_running_run failed — fall back to legacy record_run.
         let status = if success { "ok" } else { "error" };
-        let _ = record_run(config, &job.id, started_at, finished_at, status, Some(&output), duration_ms);
+        let _ = record_run(
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            Some(&output),
+            duration_ms,
+        );
     }
 
-    let success = persist_job_result_no_record(config, job, success, &output, started_at, finished_at).await;
+    let success =
+        persist_job_result_no_record(config, job, success, &output, started_at, finished_at).await;
     (job.id.clone(), success, output)
 }
 
@@ -470,7 +497,7 @@ fn detect_missed_jobs(config: &Config, now: DateTime<Utc>) {
         }
 
         // Within grace period — normal scheduler will handle it shortly.
-        if grace_secs > 0 && (overdue_secs as u64) <= grace_secs {
+        if grace_secs > 0 && u64::try_from(overdue_secs).unwrap_or(0) <= grace_secs {
             continue;
         }
 
@@ -1003,7 +1030,14 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        process_due_jobs(
+            &config,
+            &security,
+            Vec::new(),
+            &component,
+            &mut JobCircuitBreaker::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1024,7 +1058,14 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job],
+            &component,
+            &mut JobCircuitBreaker::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];

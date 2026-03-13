@@ -2534,7 +2534,8 @@ impl Default for ReliabilityConfig {
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
             provider_circuit_breaker_threshold: default_provider_circuit_breaker_threshold(),
-            provider_circuit_breaker_cooldown_mins: default_provider_circuit_breaker_cooldown_mins(),
+            provider_circuit_breaker_cooldown_mins: default_provider_circuit_breaker_cooldown_mins(
+            ),
         }
     }
 }
@@ -6045,6 +6046,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            daemon: DaemonConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6229,6 +6231,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            daemon: DaemonConfig::default(),
         };
 
         config.save().await.unwrap();

@@ -926,7 +926,12 @@ async fn persist_conversation_history(
         return;
     };
     if let Err(e) = memory
-        .store(key, &json, crate::memory::MemoryCategory::Conversation, None)
+        .store(
+            key,
+            &json,
+            crate::memory::MemoryCategory::Conversation,
+            None,
+        )
         .await
     {
         tracing::warn!(key, "Failed to persist conversation history: {e}");
@@ -937,7 +942,9 @@ async fn persist_conversation_history(
 ///
 /// Entries are stored under keys with the `ch_hist:` prefix followed by
 /// `channel:sender`.  Malformed entries are skipped with a warning.
-async fn load_conversation_histories(memory: &Arc<dyn Memory>) -> HashMap<String, Vec<ChatMessage>> {
+async fn load_conversation_histories(
+    memory: &Arc<dyn Memory>,
+) -> HashMap<String, Vec<ChatMessage>> {
     let mut out: HashMap<String, Vec<ChatMessage>> = HashMap::new();
     let prefix = HISTORY_KEY_PREFIX;
     let entries = match memory.recall(prefix, 256, None).await {
@@ -963,7 +970,10 @@ async fn load_conversation_histories(memory: &Arc<dyn Memory>) -> HashMap<String
         }
     }
     if !out.is_empty() {
-        tracing::info!(count = out.len(), "Restored conversation histories from memory");
+        tracing::info!(
+            count = out.len(),
+            "Restored conversation histories from memory"
+        );
     }
     out
 }
@@ -1648,7 +1658,7 @@ fn spawn_supervised_listener_with_health_interval(
                             crate::health::mark_component_ok(&component);
                         }
                         result = &mut listen_future => break result,
-                        _ = shutdown_token.cancelled() => {
+                        () = shutdown_token.cancelled() => {
                             tracing::debug!(
                                 "Channel listener '{}' exiting due to shutdown token",
                                 ch.name()
@@ -1684,8 +1694,8 @@ fn spawn_supervised_listener_with_health_interval(
             crate::health::bump_component_restart(&component);
 
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
-                _ = shutdown_token.cancelled() => {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown_token.cancelled() => {
                     tracing::debug!("Channel '{}' backoff interrupted by shutdown", ch.name());
                     return;
                 }
@@ -1720,7 +1730,9 @@ fn spawn_channel_health_watcher(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if !ch.health_check().await {
+                    if ch.health_check().await {
+                        crate::health::mark_component_ok(&component);
+                    } else {
                         tracing::warn!(
                             channel = ch.name(),
                             "Channel health check failed — triggering restart"
@@ -1734,11 +1746,9 @@ fn spawn_channel_health_watcher(
                         // Re-arm the watcher: child tokens are not reusable, so
                         // the supervisor creates a new one on each restart.
                         return;
-                    } else {
-                        crate::health::mark_component_ok(&component);
                     }
                 }
-                _ = shutdown_token.cancelled() => {
+                () = shutdown_token.cancelled() => {
                     return;
                 }
             }
@@ -2262,7 +2272,7 @@ async fn process_channel_message(
                     .get(&history_key)
                     .map(|h| h.len())
                     .unwrap_or(0);
-                if history_len > 0 && history_len % HISTORY_PERSIST_INTERVAL == 0 {
+                if history_len > 0 && history_len.is_multiple_of(HISTORY_PERSIST_INTERVAL) {
                     let history_snapshot = ctx
                         .conversation_histories
                         .lock()
@@ -3706,9 +3716,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         min_relevance_score: config.memory.min_relevance_score,
         // Restore persisted conversation histories from the memory backend so
         // sessions survive daemon restarts.
-        conversation_histories: Arc::new(Mutex::new(
-            load_conversation_histories(&mem).await,
-        )),
+        conversation_histories: Arc::new(Mutex::new(load_conversation_histories(&mem).await)),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),

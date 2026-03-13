@@ -203,7 +203,7 @@ fn spawn_state_writer(config: Config, shutdown_token: CancellationToken) -> Join
                     let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
                     let _ = tokio::fs::write(&path, data).await;
                 }
-                _ = shutdown_token.cancelled() => {
+                () = shutdown_token.cancelled() => {
                     // Write a final snapshot before exiting.
                     let mut json = crate::health::snapshot_json();
                     if let Some(obj) = json.as_object_mut() {
@@ -283,7 +283,7 @@ where
             // Run the component and race it against a shutdown signal.
             let result = tokio::select! {
                 r = run_component() => r,
-                _ = shutdown_token.cancelled() => {
+                () = shutdown_token.cancelled() => {
                     tracing::debug!("Daemon component '{name}' supervisor exiting due to shutdown");
                     return;
                 }
@@ -310,8 +310,8 @@ where
 
             // Wait for backoff or shutdown — whichever comes first.
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
-                _ = shutdown_token.cancelled() => {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown_token.cancelled() => {
                     tracing::debug!(
                         "Daemon component '{name}' supervisor aborting backoff due to shutdown"
                     );
