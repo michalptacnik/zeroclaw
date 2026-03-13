@@ -494,7 +494,6 @@ mod tests {
             success: true,
             output: "ok".into(),
             error: None,
-            metadata: None,
         };
         // Call with a non-matching tool — should not panic or do anything.
         hook.on_after_tool_call("Write", &result, Duration::from_millis(10))
@@ -518,7 +517,6 @@ mod tests {
             success: true,
             output: "ok".into(),
             error: None,
-            metadata: None,
         };
         // Should return immediately without spawning any HTTP request.
         hook.on_after_tool_call("Bash", &result, Duration::from_millis(5))

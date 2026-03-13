@@ -49,7 +49,6 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                metadata: None,
             });
         }
 
@@ -60,7 +59,6 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'job_id' parameter".to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -74,7 +72,6 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
-                metadata: None,
             });
         }
 
@@ -83,7 +80,6 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                metadata: None,
             });
         }
 
@@ -94,7 +90,6 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -108,7 +103,6 @@ impl Tool for CronRunTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
-                    metadata: None,
                 });
             }
         }
@@ -118,7 +112,6 @@ impl Tool for CronRunTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
-                metadata: None,
             });
         }
 
@@ -152,7 +145,6 @@ impl Tool for CronRunTool {
             } else {
                 Some("cron job execution failed".to_string())
             },
-            metadata: None,
         })
     }
 }

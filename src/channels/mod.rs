@@ -93,7 +93,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -1808,7 +1807,6 @@ async fn process_channel_message(
         return;
     }
 
-    let attempt_id = Uuid::new_v4().to_string();
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -1824,7 +1822,6 @@ async fn process_channel_message(
         None,
         None,
         serde_json::json!({
-            "attempt_id": attempt_id,
             "sender": msg.sender,
             "message_id": msg.id,
             "reply_target": msg.reply_target,
@@ -1911,18 +1908,6 @@ async fn process_channel_message(
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{attempt_scoped_content}");
             }
-        } else {
-            prior_turns.push(ChatMessage::user(format!(
-                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{}",
-                msg.content
-            )));
-        }
-    } else if let Some(last_turn) = prior_turns.last_mut() {
-        if last_turn.role == "user" {
-            last_turn.content = format!(
-                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{}",
-                last_turn.content
-            );
         }
     }
 
@@ -4476,7 +4461,6 @@ BTC is currently around $65,000 based on latest tool output."#
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
-                    metadata: None,
                 });
             }
 
@@ -4484,7 +4468,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
-                metadata: None,
             })
         }
     }

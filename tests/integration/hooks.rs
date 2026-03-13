@@ -88,7 +88,6 @@ async fn hook_runner_full_pipeline() {
         success: true,
         output: "ok".into(),
         error: None,
-        metadata: None,
     };
     runner
         .fire_after_tool_call("safe_tool", &tool_result, Duration::from_millis(10))

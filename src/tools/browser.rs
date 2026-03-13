@@ -5,7 +5,7 @@
 //! `--features browser-native` and selected through config.
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
-use super::traits::{ProofArtifact, Tool, ToolResult, ToolResultMetadata};
+use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -746,7 +746,6 @@ impl BrowserTool {
                 success: true,
                 output: serde_json::to_string_pretty(&output).unwrap_or_default(),
                 error: None,
-                metadata: None,
             })
         }
 
@@ -878,56 +877,6 @@ impl BrowserTool {
 
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
-                let metadata = if action == "verify_artifact" {
-                    parsed.data.as_ref().and_then(|data| {
-                        let verified = data.get("verified").and_then(Value::as_bool)?;
-                        if !verified {
-                            return None;
-                        }
-                        Some(ToolResultMetadata {
-                            attempt_id: data
-                                .get("attempt_id")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                            proofs: vec![ProofArtifact {
-                                kind: data
-                                    .get("artifact_kind")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("browser_artifact")
-                                    .to_string(),
-                                id: data
-                                    .get("artifact_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("browser-proof")
-                                    .to_string(),
-                                summary: data
-                                    .get("summary")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("Fresh browser proof")
-                                    .to_string(),
-                                created_at: data
-                                    .get("created_at")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string),
-                                attempt_id: data
-                                    .get("attempt_id")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string),
-                                fresh: true,
-                                fallback: data
-                                    .get("fallback")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false),
-                                terminal: false,
-                            }],
-                            extra: Some(data.clone()),
-                            ..ToolResultMetadata::default()
-                        })
-                    })
-                } else {
-                    None
-                };
-
                 let output = parsed
                     .data
                     .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
@@ -944,7 +893,6 @@ impl BrowserTool {
                     success: true,
                     output,
                     error: None,
-                    metadata,
                 });
             }
 
@@ -962,7 +910,6 @@ impl BrowserTool {
                 success: false,
                 output: String::new(),
                 error,
-                metadata: None,
             });
         }
 
@@ -971,7 +918,6 @@ impl BrowserTool {
                 success: true,
                 output: body,
                 error: None,
-                metadata: None,
             });
         }
 
@@ -982,7 +928,6 @@ impl BrowserTool {
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
             )),
-            metadata: None,
         })
     }
 
@@ -1026,14 +971,12 @@ impl BrowserTool {
                 success: true,
                 output,
                 error: None,
-                metadata: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: resp.error,
-                metadata: None,
             })
         }
     }
@@ -1117,30 +1060,6 @@ impl Tool for BrowserTool {
                     "enum": ["left", "right", "middle"],
                     "description": "Mouse button for computer_use mouse_click"
                 },
-                "window": {
-                    "type": "string",
-                    "description": "Window identifier or title for focus_window"
-                },
-                "tab": {
-                    "type": "string",
-                    "description": "Tab identifier, title, or URL fragment for focus_tab"
-                },
-                "artifact_kind": {
-                    "type": "string",
-                    "description": "Artifact type for verify_artifact (post, email, comment, blog_post, generic)"
-                },
-                "expected_text": {
-                    "type": "string",
-                    "description": "Expected content snippet for verify_artifact"
-                },
-                "created_after": {
-                    "type": "string",
-                    "description": "RFC3339 timestamp lower bound for verify_artifact"
-                },
-                "url_pattern": {
-                    "type": "string",
-                    "description": "Expected URL fragment or pattern for verify_artifact"
-                },
                 "direction": {
                     "type": "string",
                     "enum": ["up", "down", "left", "right"],
@@ -1220,7 +1139,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                metadata: None,
             });
         }
 
@@ -1229,7 +1147,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                metadata: None,
             });
         }
 
@@ -1240,7 +1157,6 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -1256,7 +1172,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown action: {action_str}")),
-                metadata: None,
             });
         }
 
@@ -1269,7 +1184,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
-                metadata: None,
             });
         }
 
@@ -1280,7 +1194,6 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -2728,11 +2641,6 @@ mod tests {
 
     #[test]
     fn computer_use_only_action_detection_is_correct() {
-        assert!(is_computer_use_only_action("list_windows"));
-        assert!(is_computer_use_only_action("focus_window"));
-        assert!(is_computer_use_only_action("list_tabs"));
-        assert!(is_computer_use_only_action("focus_tab"));
-        assert!(is_computer_use_only_action("verify_artifact"));
         assert!(is_computer_use_only_action("mouse_move"));
         assert!(is_computer_use_only_action("mouse_click"));
         assert!(is_computer_use_only_action("mouse_drag"));

@@ -171,7 +171,6 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'agent' parameter must not be empty".into()),
-                metadata: None,
             });
         }
 
@@ -186,7 +185,6 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'prompt' parameter must not be empty".into()),
-                metadata: None,
             });
         }
 
@@ -213,7 +211,6 @@ impl Tool for DelegateTool {
                             available.join(", ")
                         }
                     )),
-                    metadata: None,
                 });
             }
         };
@@ -229,7 +226,6 @@ impl Tool for DelegateTool {
                     depth = self.depth,
                     max = agent_config.max_depth
                 )),
-                metadata: None,
             });
         }
 
@@ -241,7 +237,6 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(error),
-                metadata: None,
             });
         }
 
@@ -267,7 +262,6 @@ impl Tool for DelegateTool {
                         "Failed to create provider '{}' for agent '{agent_name}': {e}",
                         agent_config.provider
                     )),
-                    metadata: None,
                 });
             }
         };
@@ -315,7 +309,6 @@ impl Tool for DelegateTool {
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
                     )),
-                    metadata: None,
                 });
             }
         };
@@ -335,14 +328,12 @@ impl Tool for DelegateTool {
                         model = agent_config.model
                     ),
                     error: None,
-                    metadata: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-                metadata: None,
             }),
         }
     }
@@ -364,7 +355,6 @@ impl DelegateTool {
                 error: Some(format!(
                     "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
                 )),
-                metadata: None,
             });
         }
 
@@ -391,7 +381,6 @@ impl DelegateTool {
                     "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
                     agent_config.allowed_tools.join(", ")
                 )),
-                metadata: None,
             });
         }
 
@@ -443,14 +432,12 @@ impl DelegateTool {
                         model = agent_config.model
                     ),
                     error: None,
-                    metadata: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}")),
-                metadata: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -458,7 +445,6 @@ impl DelegateTool {
                 error: Some(format!(
                     "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
                 )),
-                metadata: None,
             }),
         }
     }
@@ -586,7 +572,6 @@ mod tests {
                 success: true,
                 output: format!("echo:{value}"),
                 error: None,
-                metadata: None,
             })
         }
     }

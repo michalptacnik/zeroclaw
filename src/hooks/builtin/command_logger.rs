@@ -57,7 +57,6 @@ mod tests {
             success: true,
             output: "ok".into(),
             error: None,
-            metadata: None,
         };
         hook.on_after_tool_call("shell", &result, Duration::from_millis(42))
             .await;

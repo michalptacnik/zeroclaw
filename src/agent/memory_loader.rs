@@ -199,7 +199,6 @@ mod tests {
             "[Memory context - background only, never proof of current-task completion]"
         ));
         assert!(context.contains("- k: v"));
-        assert!(context.contains("never proof"));
     }
 
     #[tokio::test]
