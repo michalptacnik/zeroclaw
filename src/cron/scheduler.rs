@@ -11,6 +11,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -19,6 +20,51 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+
+/// In-memory per-job circuit breaker state.
+///
+/// Tracks consecutive failures per job ID.  When a job's failure count
+/// reaches `scheduler.circuit_breaker_threshold` it is skipped on subsequent
+/// poll ticks with a warning.  The counter resets to 0 on the first success.
+#[derive(Default)]
+struct JobCircuitBreaker {
+    consecutive_failures: HashMap<String, u32>,
+}
+
+impl JobCircuitBreaker {
+    /// Returns `true` if the job should be skipped (circuit open).
+    fn is_open(&self, job_id: &str, threshold: u32) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        self.consecutive_failures
+            .get(job_id)
+            .copied()
+            .unwrap_or(0)
+            >= threshold
+    }
+
+    /// Record a successful run — resets the failure counter.
+    fn record_success(&mut self, job_id: &str) {
+        self.consecutive_failures.remove(job_id);
+    }
+
+    /// Record a failed run — increments the failure counter.
+    fn record_failure(&mut self, job_id: &str) -> u32 {
+        let count = self
+            .consecutive_failures
+            .entry(job_id.to_string())
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Manually reset a job's circuit breaker (e.g. after a config change).
+    #[cfg(test)]
+    fn reset(&mut self, job_id: &str) {
+        self.consecutive_failures.remove(job_id);
+    }
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -35,6 +81,8 @@ pub async fn run(config: Config) -> Result<()> {
     // unclean shutdown and re-queue jobs that were missed.
     sweep_and_detect_on_startup(&config);
 
+    let mut circuit_breaker = JobCircuitBreaker::default();
+
     loop {
         interval.tick().await;
         // Keep scheduler liveness fresh even when there are no due jobs.
@@ -49,7 +97,8 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &mut circuit_breaker)
+            .await;
     }
 }
 
@@ -98,14 +147,38 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    circuit_breaker: &mut JobCircuitBreaker,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
+    let threshold = config.scheduler.circuit_breaker_threshold;
     let max_concurrent = config.scheduler.max_concurrent.max(1);
+
+    // Filter out jobs whose circuit breaker is open before dispatching.
+    let (runnable, skipped): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|job| !circuit_breaker.is_open(&job.id, threshold));
+
+    for job in &skipped {
+        let failures = circuit_breaker
+            .consecutive_failures
+            .get(&job.id)
+            .copied()
+            .unwrap_or(0);
+        let name = job.name.as_deref().unwrap_or(&job.id);
+        tracing::warn!(
+            job_id = %job.id,
+            job_name = name,
+            consecutive_failures = failures,
+            threshold,
+            "Skipping cron job — circuit breaker open"
+        );
+    }
+
     let mut in_flight =
         stream::iter(
-            jobs.into_iter().map(|job| {
+            runnable.into_iter().map(|job| {
                 let config = config.clone();
                 let security = Arc::clone(security);
                 let component = component.to_owned();
@@ -117,8 +190,19 @@ async fn process_due_jobs(
         .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success, output)) = in_flight.next().await {
-        if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
+        if success {
+            circuit_breaker.record_success(&job_id);
+        } else {
+            let failures = circuit_breaker.record_failure(&job_id);
+            tracing::warn!("Scheduler job '{job_id}' failed (consecutive={failures}): {output}");
+            if threshold > 0 && failures >= threshold {
+                tracing::warn!(
+                    job_id = %job_id,
+                    failures,
+                    threshold,
+                    "Cron job circuit breaker tripped — job will be skipped on next ticks"
+                );
+            }
         }
     }
 }
