@@ -397,11 +397,7 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                     });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
+                    (r.success, r.output, r.error, r.metadata)
                 }
                 Err(e) => {
                     self.observer.record_event(&ObserverEvent::ToolCall {
@@ -409,18 +405,36 @@ impl Agent {
                         duration: start.elapsed(),
                         success: false,
                     });
-                    format!("Error executing {}: {e}", call.name)
+                    (
+                        false,
+                        String::new(),
+                        Some(format!("Error executing {}: {e}", call.name)),
+                        None,
+                    )
                 }
             }
         } else {
-            format!("Unknown tool: {}", call.name)
+            (
+                false,
+                String::new(),
+                Some(format!("Unknown tool: {}", call.name)),
+                None,
+            )
+        };
+
+        let (success, output, error, metadata) = result;
+        let rendered = if success {
+            output
+        } else {
+            format!("Error: {}", error.unwrap_or(output))
         };
 
         ToolExecutionResult {
             name: call.name.clone(),
-            output: result,
-            success: true,
+            output: rendered,
+            success,
             tool_call_id: call.tool_call_id.clone(),
+            metadata,
         }
     }
 
@@ -485,12 +499,17 @@ impl Agent {
             .load_context(self.memory.as_ref(), user_message)
             .await
             .unwrap_or_default();
+        let attempt_id = uuid::Uuid::new_v4().to_string();
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
+            format!(
+                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n[{now}] {user_message}"
+            )
         } else {
-            format!("{context}[{now}] {user_message}")
+            format!(
+                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{context}[{now}] {user_message}"
+            )
         };
 
         self.history
@@ -749,6 +768,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
+                metadata: None,
             })
         }
     }

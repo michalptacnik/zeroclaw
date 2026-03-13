@@ -134,6 +134,10 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Planner/executor orchestration for external-action tasks.
+    #[serde(default)]
+    pub planner_execution: PlannerExecutionConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -2622,6 +2626,125 @@ pub struct ClassificationRule {
     pub priority: i32,
 }
 
+fn default_external_action_hint() -> String {
+    "external_action".to_string()
+}
+
+fn default_planner_scope() -> String {
+    "external_actions".to_string()
+}
+
+fn default_planner_hint() -> String {
+    "planner".to_string()
+}
+
+fn default_executor_hint() -> String {
+    "executor".to_string()
+}
+
+fn default_planner_simple_hints() -> Vec<String> {
+    vec![
+        "fast".to_string(),
+        "chat".to_string(),
+        "executor".to_string(),
+    ]
+}
+
+fn default_planner_visibility_threshold() -> u32 {
+    12
+}
+
+fn default_external_action_rules() -> Vec<ClassificationRule> {
+    let hint = default_external_action_hint();
+    vec![
+        ClassificationRule {
+            hint: hint.clone(),
+            keywords: vec![
+                "post".into(),
+                "publish".into(),
+                "send".into(),
+                "email".into(),
+                "gmail".into(),
+                "browser".into(),
+                "comment".into(),
+                "reply".into(),
+                "click".into(),
+                "open".into(),
+                "upload".into(),
+                "x.com".into(),
+                "twitter".into(),
+            ],
+            patterns: vec![],
+            min_length: None,
+            max_length: None,
+            priority: 20,
+        },
+        ClassificationRule {
+            hint,
+            keywords: vec![],
+            patterns: vec!["http://".into(), "https://".into()],
+            min_length: None,
+            max_length: None,
+            priority: 5,
+        },
+    ]
+}
+
+fn default_external_action_classification() -> QueryClassificationConfig {
+    QueryClassificationConfig {
+        enabled: true,
+        rules: default_external_action_rules(),
+    }
+}
+
+/// Planner/executor orchestration for external-effecting tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlannerExecutionConfig {
+    /// Enable planner/executor orchestration. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Planner scope. Only `external_actions` is currently supported.
+    #[serde(default = "default_planner_scope")]
+    pub scope: String,
+    /// Route hint for the planner/thinker model.
+    #[serde(default = "default_planner_hint")]
+    pub planner_hint: String,
+    /// Route hint for the executor/chat model.
+    #[serde(default = "default_executor_hint")]
+    pub executor_hint: String,
+    /// Classification hints that should bypass planning and execute directly.
+    #[serde(default = "default_planner_simple_hints")]
+    pub simple_hints: Vec<String>,
+    /// Show a brief planner summary when estimate exceeds this threshold.
+    #[serde(default = "default_planner_visibility_threshold")]
+    pub show_plan_when_turn_estimate_over: u32,
+    /// Show a brief planner summary when the planner requests confirmation.
+    #[serde(default = "default_true")]
+    pub show_plan_when_approval_required: bool,
+    /// Fall back to executor-only behavior when planner routing or parsing fails.
+    #[serde(default = "default_true")]
+    pub fallback_to_executor_on_planner_error: bool,
+    /// Separate rule set for detecting external-action tasks.
+    #[serde(default = "default_external_action_classification")]
+    pub external_action_classification: QueryClassificationConfig,
+}
+
+impl Default for PlannerExecutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scope: default_planner_scope(),
+            planner_hint: default_planner_hint(),
+            executor_hint: default_executor_hint(),
+            simple_hints: default_planner_simple_hints(),
+            show_plan_when_turn_estimate_over: default_planner_visibility_threshold(),
+            show_plan_when_approval_required: true,
+            fallback_to_executor_on_planner_error: true,
+            external_action_classification: default_external_action_classification(),
+        }
+    }
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
@@ -3842,6 +3965,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
+            planner_execution: PlannerExecutionConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -4754,6 +4878,40 @@ impl Config {
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+
+        if self.planner_execution.scope.trim() != "external_actions" {
+            anyhow::bail!(
+                "planner_execution.scope must be 'external_actions' (got '{}')",
+                self.planner_execution.scope
+            );
+        }
+        if self.planner_execution.planner_hint.trim().is_empty() {
+            anyhow::bail!("planner_execution.planner_hint must not be empty");
+        }
+        if self.planner_execution.executor_hint.trim().is_empty() {
+            anyhow::bail!("planner_execution.executor_hint must not be empty");
+        }
+        if self
+            .planner_execution
+            .simple_hints
+            .iter()
+            .any(|hint| hint.trim().is_empty())
+        {
+            anyhow::bail!("planner_execution.simple_hints must not contain empty values");
+        }
+        for (i, rule) in self
+            .planner_execution
+            .external_action_classification
+            .rules
+            .iter()
+            .enumerate()
+        {
+            if rule.hint.trim().is_empty() {
+                anyhow::bail!(
+                    "planner_execution.external_action_classification.rules[{i}].hint must not be empty"
+                );
             }
         }
 
@@ -5759,6 +5917,7 @@ default_temperature = 0.7
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            planner_execution: PlannerExecutionConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -5979,6 +6138,7 @@ tool_dispatcher = "xml"
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            planner_execution: PlannerExecutionConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),

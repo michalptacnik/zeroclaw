@@ -94,6 +94,7 @@ impl Tool for HardwareCapabilitiesTool {
             success: !outputs.is_empty(),
             output,
             error: None,
+            metadata: None,
         })
     }
 }

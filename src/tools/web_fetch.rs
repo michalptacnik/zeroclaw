@@ -118,6 +118,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                metadata: None,
             });
         }
 
@@ -126,6 +127,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                metadata: None,
             });
         }
 
@@ -136,6 +138,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    metadata: None,
                 })
             }
         };
@@ -183,6 +186,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
+                    metadata: None,
                 })
             }
         };
@@ -194,6 +198,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("HTTP request failed: {e}")),
+                    metadata: None,
                 })
             }
         };
@@ -208,6 +213,7 @@ impl Tool for WebFetchTool {
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown")
                 )),
+                metadata: None,
             });
         }
 
@@ -234,6 +240,7 @@ impl Tool for WebFetchTool {
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
                 )),
+                metadata: None,
             });
         };
 
@@ -244,6 +251,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read response body: {e}")),
+                    metadata: None,
                 })
             }
         };
@@ -260,6 +268,7 @@ impl Tool for WebFetchTool {
             success: true,
             output,
             error: None,
+            metadata: None,
         })
     }
 }

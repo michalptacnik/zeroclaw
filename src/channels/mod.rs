@@ -93,6 +93,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -1246,7 +1247,9 @@ async fn build_memory_context(
             }
 
             if included == 0 {
-                context.push_str("[Memory context]\n");
+                context.push_str(
+                    "[Memory context — historical context only, never proof for the current attempt]\n",
+                );
             }
 
             context.push_str(&line);
@@ -1648,6 +1651,7 @@ async fn process_channel_message(
         return;
     }
 
+    let attempt_id = Uuid::new_v4().to_string();
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -1663,6 +1667,7 @@ async fn process_channel_message(
         None,
         None,
         serde_json::json!({
+            "attempt_id": attempt_id,
             "sender": msg.sender,
             "message_id": msg.id,
             "reply_target": msg.reply_target,
@@ -1755,9 +1760,31 @@ async fn process_channel_message(
         let memory_context =
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+            if last_turn.role == "user" {
+                if memory_context.is_empty() {
+                    last_turn.content = format!(
+                        "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{}",
+                        msg.content
+                    );
+                } else {
+                    last_turn.content = format!(
+                        "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{memory_context}{}",
+                        msg.content
+                    );
+                }
             }
+        } else {
+            prior_turns.push(ChatMessage::user(format!(
+                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{}",
+                msg.content
+            )));
+        }
+    } else if let Some(last_turn) = prior_turns.last_mut() {
+        if last_turn.role == "user" {
+            last_turn.content = format!(
+                "[Attempt ID: {attempt_id}]\n[Execution rule] Historical context is not proof for this attempt. If you complete an external action, cite a fresh artifact created during this attempt.\n{}",
+                last_turn.content
+            );
         }
     }
 
@@ -4262,6 +4289,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
+                    metadata: None,
                 });
             }
 
@@ -4269,6 +4297,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
+                metadata: None,
             })
         }
     }
@@ -5915,7 +5944,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
 
         let context = build_memory_context(&mem, "age", 0.0).await;
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[Memory context"));
         assert!(context.contains("Age is 45"));
     }
 
@@ -6066,7 +6095,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
+        assert!(calls[0][1].1.contains("[Memory context"));
         assert!(calls[0][1].1.contains("Age is 45"));
         assert!(calls[0][1].1.contains("hello"));
 

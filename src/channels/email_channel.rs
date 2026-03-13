@@ -127,6 +127,25 @@ pub struct EmailChannel {
     seen_messages: Arc<Mutex<HashSet<String>>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailMessageRecord {
+    pub message_id: String,
+    pub sender: String,
+    pub recipients: Vec<String>,
+    pub subject: String,
+    pub content: String,
+    pub timestamp: u64,
+    pub folder: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SentEmailReceipt {
+    pub message_id: String,
+    pub recipient: String,
+    pub subject: String,
+    pub sent_at: String,
+}
+
 impl EmailChannel {
     pub fn new(config: EmailConfig) -> Self {
         Self {
@@ -188,6 +207,60 @@ impl EmailChannel {
             .and_then(|a| a.address())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".into())
+    }
+
+    fn extract_recipients(parsed: &mail_parser::Message) -> Vec<String> {
+        parsed
+            .to()
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter_map(|addr| addr.address().map(|v| v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn parsed_to_record(parsed: &mail_parser::Message, folder: &str) -> EmailMessageRecord {
+        let sender = Self::extract_sender(parsed);
+        let recipients = Self::extract_recipients(parsed);
+        let subject = parsed.subject().unwrap_or("(no subject)").to_string();
+        let content = format!("Subject: {}\n\n{}", subject, Self::extract_text(parsed));
+        let message_id = parsed
+            .message_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+
+        #[allow(clippy::cast_sign_loss)]
+        let timestamp = parsed
+            .date()
+            .map(|d| {
+                let naive = chrono::NaiveDate::from_ymd_opt(
+                    d.year as i32,
+                    u32::from(d.month),
+                    u32::from(d.day),
+                )
+                .and_then(|date| {
+                    date.and_hms_opt(u32::from(d.hour), u32::from(d.minute), u32::from(d.second))
+                });
+                naive.map_or(0, |n| n.and_utc().timestamp() as u64)
+            })
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+
+        EmailMessageRecord {
+            message_id,
+            sender,
+            recipients,
+            subject,
+            content,
+            timestamp,
+            folder: folder.to_string(),
+        }
     }
 
     /// Extract readable text from a parsed email
@@ -324,6 +397,152 @@ impl EmailChannel {
         }
 
         Ok(results)
+    }
+
+    async fn fetch_recent_from_folder(
+        &self,
+        folder: &str,
+        limit: usize,
+    ) -> Result<Vec<EmailMessageRecord>> {
+        let mut session = self.connect_imap().await?;
+        session.select(folder).await?;
+
+        let uids = session.uid_search("ALL").await?;
+        if uids.is_empty() {
+            let _ = session.logout().await;
+            return Ok(Vec::new());
+        }
+
+        let mut selected_uids: Vec<u32> = uids.iter().copied().collect();
+        selected_uids.sort_unstable();
+        let take = limit.max(1).min(selected_uids.len());
+        let selected: Vec<String> = selected_uids
+            .into_iter()
+            .rev()
+            .take(take)
+            .map(|uid| uid.to_string())
+            .collect();
+        let uid_set = selected.join(",");
+        let messages_stream = session.uid_fetch(&uid_set, "RFC822").await?;
+        let messages: Vec<Fetch> = messages_stream.try_collect().await?;
+        let _ = session.logout().await;
+
+        let mut records = Vec::new();
+        for msg in messages {
+            if let Some(body) = msg.body() {
+                if let Some(parsed) = MessageParser::default().parse(body) {
+                    records.push(Self::parsed_to_record(&parsed, folder));
+                }
+            }
+        }
+
+        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(records)
+    }
+
+    async fn find_message_in_folder(
+        &self,
+        folder: &str,
+        message_id: &str,
+    ) -> Result<Option<EmailMessageRecord>> {
+        let mut session = self.connect_imap().await?;
+        session.select(folder).await?;
+        let query = format!("HEADER Message-ID \"{message_id}\"");
+        let uids = session.uid_search(&query).await?;
+        if uids.is_empty() {
+            let _ = session.logout().await;
+            return Ok(None);
+        }
+
+        let uid_set = uids
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let messages = session.uid_fetch(&uid_set, "RFC822").await?;
+        let messages: Vec<Fetch> = messages.try_collect().await?;
+        let _ = session.logout().await;
+
+        for msg in messages {
+            if let Some(body) = msg.body() {
+                if let Some(parsed) = MessageParser::default().parse(body) {
+                    let record = Self::parsed_to_record(&parsed, folder);
+                    if record.message_id == message_id {
+                        return Ok(Some(record));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn list_recent_messages(
+        &self,
+        folder: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EmailMessageRecord>> {
+        let folder = folder.unwrap_or(&self.config.imap_folder);
+        self.fetch_recent_from_folder(folder, limit).await
+    }
+
+    pub async fn get_message(
+        &self,
+        message_id: &str,
+        folder: Option<&str>,
+    ) -> Result<Option<EmailMessageRecord>> {
+        let folder = folder.unwrap_or(&self.config.imap_folder);
+        self.find_message_in_folder(folder, message_id).await
+    }
+
+    pub async fn verify_sent_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<EmailMessageRecord>> {
+        for folder in [
+            "Sent",
+            "Sent Mail",
+            "INBOX.Sent",
+            "[Gmail]/Sent Mail",
+            &self.config.imap_folder,
+        ] {
+            if let Ok(found) = self.find_message_in_folder(folder, message_id).await {
+                if found.is_some() {
+                    return Ok(found);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn send_email(
+        &self,
+        recipient: &str,
+        subject: Option<&str>,
+        body: &str,
+        message_id: Option<&str>,
+    ) -> Result<SentEmailReceipt> {
+        let subject = subject.unwrap_or(&self.config.default_subject);
+        let generated_message_id = message_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("<zeroclaw-{}@localhost>", Uuid::new_v4()));
+
+        let email = Message::builder()
+            .from(self.config.from_address.parse()?)
+            .to(recipient.parse()?)
+            .subject(subject)
+            .message_id(Some(generated_message_id.clone()))
+            .singlepart(SinglePart::plain(body.to_string()))?;
+
+        let transport = self.create_smtp_transport()?;
+        transport.send(&email)?;
+
+        Ok(SentEmailReceipt {
+            message_id: generated_message_id,
+            recipient: recipient.to_string(),
+            subject: subject.to_string(),
+            sent_at: chrono::Utc::now().to_rfc3339(),
+        })
     }
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
@@ -532,14 +751,7 @@ impl Channel for EmailChannel {
             (default_subject, message.content.as_str())
         };
 
-        let email = Message::builder()
-            .from(self.config.from_address.parse()?)
-            .to(message.recipient.parse()?)
-            .subject(subject)
-            .singlepart(SinglePart::plain(body.to_string()))?;
-
-        let transport = self.create_smtp_transport()?;
-        transport.send(&email)?;
+        self.send_email(&message.recipient, Some(subject), body, None)?;
         info!("Email sent to {}", message.recipient);
         Ok(())
     }

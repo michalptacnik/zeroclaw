@@ -43,7 +43,9 @@ impl MemoryLoader for DefaultMemoryLoader {
             return Ok(String::new());
         }
 
-        let mut context = String::from("[Memory context]\n");
+        let mut context = String::from(
+            "[Memory context — historical context only, never proof for the current attempt]\n",
+        );
         for entry in entries {
             if memory::is_assistant_autosave_key(&entry.key) {
                 continue;
@@ -57,7 +59,9 @@ impl MemoryLoader for DefaultMemoryLoader {
         }
 
         // If all entries were below threshold, return empty
-        if context == "[Memory context]\n" {
+        if context
+            == "[Memory context — historical context only, never proof for the current attempt]\n"
+        {
             return Ok(String::new());
         }
 
@@ -192,8 +196,9 @@ mod tests {
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
         let context = loader.load_context(&MockMemory, "hello").await.unwrap();
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[Memory context"));
         assert!(context.contains("- k: v"));
+        assert!(context.contains("never proof"));
     }
 
     #[tokio::test]

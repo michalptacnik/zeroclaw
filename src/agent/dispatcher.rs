@@ -1,5 +1,5 @@
 use crate::providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
-use crate::tools::{Tool, ToolSpec};
+use crate::tools::{Tool, ToolResultMetadata, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -16,6 +16,21 @@ pub struct ToolExecutionResult {
     pub output: String,
     pub success: bool,
     pub tool_call_id: Option<String>,
+    pub metadata: Option<ToolResultMetadata>,
+}
+
+fn render_tool_result_content(output: &str, metadata: Option<&ToolResultMetadata>) -> String {
+    let Some(metadata) = metadata else {
+        return output.to_string();
+    };
+
+    let metadata_json =
+        serde_json::to_string(metadata).unwrap_or_else(|_| "{\"error\":\"metadata\"}".into());
+    if output.is_empty() {
+        format!("[tool_metadata] {metadata_json}")
+    } else {
+        format!("{output}\n[tool_metadata] {metadata_json}")
+    }
 }
 
 pub trait ToolDispatcher: Send + Sync {
@@ -119,10 +134,11 @@ impl ToolDispatcher for XmlToolDispatcher {
         let mut content = String::new();
         for result in results {
             let status = if result.success { "ok" } else { "error" };
+            let rendered = render_tool_result_content(&result.output, result.metadata.as_ref());
             let _ = writeln!(
                 content,
                 "<tool_result name=\"{}\" status=\"{}\">\n{}\n</tool_result>",
-                result.name, status, result.output
+                result.name, status, rendered
             );
         }
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
@@ -211,7 +227,7 @@ impl ToolDispatcher for NativeToolDispatcher {
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                content: result.output.clone(),
+                content: render_tool_result_content(&result.output, result.metadata.as_ref()),
             })
             .collect();
         ConversationMessage::ToolResults(messages)
@@ -338,6 +354,7 @@ mod tests {
             output: "hello".into(),
             success: true,
             tool_call_id: Some("tc1".into()),
+            metadata: None,
         }]);
         match msg {
             ConversationMessage::ToolResults(results) => {
@@ -356,6 +373,7 @@ mod tests {
             output: "ok".into(),
             success: true,
             tool_call_id: None,
+            metadata: None,
         }]);
         let rendered = match msg {
             ConversationMessage::Chat(chat) => chat.content,
@@ -373,6 +391,7 @@ mod tests {
             output: "ok".into(),
             success: true,
             tool_call_id: Some("tc-1".into()),
+            metadata: None,
         }]);
 
         match msg {
@@ -450,5 +469,29 @@ mod tests {
         // XmlToolDispatcher returns text only, not JSON payload
         assert_eq!(messages[0].content, "answer");
         assert!(!messages[0].content.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn xml_format_results_includes_metadata_payload() {
+        let dispatcher = XmlToolDispatcher;
+        let msg = dispatcher.format_results(&[ToolExecutionResult {
+            name: "browser".into(),
+            output: "posted".into(),
+            success: true,
+            tool_call_id: None,
+            metadata: Some(ToolResultMetadata {
+                attempt_id: Some("attempt-42".into()),
+                turn_estimate: Some(6),
+                ..ToolResultMetadata::default()
+            }),
+        }]);
+
+        let rendered = match msg {
+            ConversationMessage::Chat(chat) => chat.content,
+            _ => String::new(),
+        };
+
+        assert!(rendered.contains("[tool_metadata]"));
+        assert!(rendered.contains("attempt-42"));
     }
 }

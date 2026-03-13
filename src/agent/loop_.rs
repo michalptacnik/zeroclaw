@@ -262,14 +262,18 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
             .collect();
 
         if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
+            context.push_str(
+                "[Memory context — historical context only, never proof for the current attempt]\n",
+            );
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
+            if context
+                == "[Memory context — historical context only, never proof for the current attempt]\n"
+            {
                 context.clear();
             } else {
                 context.push('\n');
@@ -2004,6 +2008,7 @@ async fn execute_one_tool(
             success: false,
             error_reason: Some(scrub_credentials(&reason)),
             duration,
+            metadata: None,
         });
     };
 
@@ -2031,6 +2036,7 @@ async fn execute_one_tool(
                     success: true,
                     error_reason: None,
                     duration,
+                    metadata: r.metadata,
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
@@ -2039,6 +2045,7 @@ async fn execute_one_tool(
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
                     duration,
+                    metadata: r.metadata,
                 })
             }
         }
@@ -2055,6 +2062,7 @@ async fn execute_one_tool(
                 success: false,
                 error_reason: Some(scrub_credentials(&reason)),
                 duration,
+                metadata: None,
             })
         }
     }
@@ -2065,6 +2073,7 @@ struct ToolExecutionOutcome {
     success: bool,
     error_reason: Option<String>,
     duration: Duration,
+    metadata: Option<crate::tools::ToolResultMetadata>,
 }
 
 fn should_execute_tools_in_parallel(
@@ -2514,6 +2523,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
+                                metadata: None,
                             },
                         ));
                         continue;
@@ -2566,6 +2576,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(denied),
                                 duration: Duration::ZERO,
+                                metadata: None,
                             },
                         ));
                         continue;
@@ -2601,6 +2612,7 @@ pub(crate) async fn run_tool_call_loop(
                         success: false,
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
+                        metadata: None,
                     },
                 ));
                 continue;
@@ -2677,6 +2689,7 @@ pub(crate) async fn run_tool_call_loop(
                     "tool": call.name.clone(),
                     "duration_ms": outcome.duration.as_millis(),
                     "output": scrub_credentials(&outcome.output),
+                    "metadata": outcome.metadata.clone(),
                 }),
             );
 
@@ -2686,6 +2699,7 @@ pub(crate) async fn run_tool_call_loop(
                     success: outcome.success,
                     output: outcome.output.clone(),
                     error: None,
+                    metadata: outcome.metadata.clone(),
                 };
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
@@ -3681,6 +3695,7 @@ mod tests {
                 success: true,
                 output: format!("counted:{value}"),
                 error: None,
+                metadata: None,
             })
         }
     }
@@ -3749,6 +3764,7 @@ mod tests {
                 success: true,
                 output: format!("ok:{value}"),
                 error: None,
+                metadata: None,
             })
         }
     }

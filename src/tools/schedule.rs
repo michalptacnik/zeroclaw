@@ -133,6 +133,7 @@ impl Tool for ScheduleTool {
                 error: Some(format!(
                     "Unknown action '{other}'. Use create/add/once/list/get/cancel/remove/pause/resume."
                 )),
+            metadata: None,
             }),
         }
     }
@@ -147,6 +148,7 @@ impl ScheduleTool {
                 error: Some(format!(
                     "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
                 )),
+                metadata: None,
             });
         }
 
@@ -157,6 +159,7 @@ impl ScheduleTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
+                metadata: None,
             });
         }
 
@@ -165,6 +168,7 @@ impl ScheduleTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                metadata: None,
             });
         }
 
@@ -178,6 +182,7 @@ impl ScheduleTool {
                 success: true,
                 output: "No scheduled jobs.".to_string(),
                 error: None,
+                metadata: None,
             });
         }
 
@@ -211,6 +216,7 @@ impl ScheduleTool {
             success: true,
             output: format!("Scheduled jobs ({}):\n{}", lines.len(), lines.join("\n")),
             error: None,
+            metadata: None,
         })
     }
 
@@ -231,12 +237,14 @@ impl ScheduleTool {
                     success: true,
                     output: serde_json::to_string_pretty(&detail)?,
                     error: None,
+                    metadata: None,
                 })
             }
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Job '{id}' not found")),
+                metadata: None,
             }),
         }
     }
@@ -264,6 +272,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'add' requires 'expression' and forbids delay/run_at".into()),
+                        metadata: None,
                     });
                 }
             }
@@ -273,6 +282,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'once' requires exactly one of 'delay' or 'run_at'".into()),
+                        metadata: None,
                     });
                 }
                 if delay.is_some() && run_at.is_some() {
@@ -280,6 +290,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some("'once' supports either delay or run_at, not both".into()),
+                        metadata: None,
                     });
                 }
             }
@@ -296,6 +307,7 @@ impl ScheduleTool {
                             "Exactly one of 'expression', 'delay', or 'run_at' must be provided"
                                 .into(),
                         ),
+                        metadata: None,
                     });
                 }
             }
@@ -320,6 +332,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some(error.to_string()),
+                        metadata: None,
                     });
                 }
             };
@@ -333,6 +346,7 @@ impl ScheduleTool {
                     job.command
                 ),
                 error: None,
+                metadata: None,
             });
         }
 
@@ -344,6 +358,7 @@ impl ScheduleTool {
                         success: false,
                         output: String::new(),
                         error: Some(error.to_string()),
+                        metadata: None,
                     });
                 }
             };
@@ -356,6 +371,7 @@ impl ScheduleTool {
                     job.command
                 ),
                 error: None,
+                metadata: None,
             });
         }
 
@@ -372,6 +388,7 @@ impl ScheduleTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
+                    metadata: None,
                 });
             }
         };
@@ -384,6 +401,7 @@ impl ScheduleTool {
                 job.command
             ),
             error: None,
+            metadata: None,
         })
     }
 
@@ -393,11 +411,13 @@ impl ScheduleTool {
                 success: true,
                 output: format!("Cancelled job {id}"),
                 error: None,
+                metadata: None,
             },
             Err(error) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
+                metadata: None,
             },
         }
     }
@@ -418,11 +438,13 @@ impl ScheduleTool {
                     format!("Resumed job {id}")
                 },
                 error: None,
+                metadata: None,
             },
             Err(error) => ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
+                metadata: None,
             },
         }
     }

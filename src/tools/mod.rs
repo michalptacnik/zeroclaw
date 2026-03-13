@@ -40,6 +40,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod mail;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -79,6 +80,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use mail::MailTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -93,7 +95,7 @@ pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
-pub use traits::{ToolResult, ToolSpec};
+pub use traits::{ProofArtifact, ToolResult, ToolResultMetadata, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -238,6 +240,10 @@ pub fn all_tools_with_runtime(
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
+        )),
+        Arc::new(MailTool::new(
+            security.clone(),
+            root_config.channels_config.email.clone(),
         )),
     ];
 
@@ -518,6 +524,7 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
+            metadata: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -532,6 +539,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
+            metadata: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

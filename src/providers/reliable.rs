@@ -4,9 +4,16 @@ use super::traits::{
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const MAX_BACKOFF_MS: u64 = 10_000;
+const MAX_RETRY_AFTER_MS: u64 = 30_000;
+const BACKOFF_JITTER_DIVISOR: u64 = 4;
+const RATE_LIMIT_COOLDOWN_BASE_MS: u64 = 10 * 60 * 1_000;
+const RATE_LIMIT_COOLDOWN_JITTER_MS: u64 = 5 * 60 * 1_000;
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -87,6 +94,61 @@ fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
+fn is_timeout(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if reqwest_err.is_timeout() {
+            return true;
+        }
+    }
+
+    let lower = err.to_string().to_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline exceeded")
+        || lower.contains("operation timed out")
+}
+
+fn is_empty_response(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    lower.contains("no response")
+        || lower.contains("empty response")
+        || lower.contains("response was empty")
+}
+
+fn is_malformed_response(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    lower.contains("error decoding response body")
+        || lower.contains("failed to decode")
+        || lower.contains("failed to parse")
+        || lower.contains("deserialize")
+        || lower.contains("deserializ")
+        || lower.contains("expected value")
+        || lower.contains("eof while parsing")
+        || lower.contains("missing field")
+}
+
+fn status_code(err: &anyhow::Error) -> Option<u16> {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            return Some(status.as_u16());
+        }
+    }
+
+    for word in err.to_string().split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = word.parse::<u16>() {
+            if (100..600).contains(&code) {
+                return Some(code);
+            }
+        }
+    }
+
+    None
+}
+
+fn is_server_error(err: &anyhow::Error) -> bool {
+    matches!(status_code(err), Some(500..=599))
+}
+
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -145,6 +207,24 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     false
 }
 
+fn error_category(err: &anyhow::Error, non_retryable: bool) -> &'static str {
+    if is_rate_limited(err) {
+        "rate_limited"
+    } else if is_timeout(err) {
+        "timeout"
+    } else if is_empty_response(err) {
+        "empty_response"
+    } else if is_malformed_response(err) {
+        "malformed_response"
+    } else if is_server_error(err) {
+        "server_error"
+    } else if non_retryable {
+        "client_error"
+    } else {
+        "retryable"
+    }
+}
+
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
 /// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
@@ -197,6 +277,45 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .join(" ")
 }
 
+fn jitter_ms(max_jitter_ms: u64) -> u64 {
+    if max_jitter_ms == 0 {
+        return 0;
+    }
+    rand::random::<u64>() % (max_jitter_ms + 1)
+}
+
+fn log_attempt_success(provider_name: &str, model: &str, attempt: u32, latency: Duration) {
+    tracing::info!(
+        provider = provider_name,
+        model,
+        attempt,
+        status_code = 200u16,
+        error_category = "ok",
+        latency_ms = latency.as_millis() as u64,
+        "Provider attempt succeeded"
+    );
+}
+
+fn log_attempt_failure(
+    provider_name: &str,
+    model: &str,
+    attempt: u32,
+    err: &anyhow::Error,
+    non_retryable: bool,
+    latency: Duration,
+) {
+    tracing::warn!(
+        provider = provider_name,
+        model,
+        attempt,
+        status_code = ?status_code(err),
+        error_category = error_category(err, non_retryable),
+        latency_ms = latency.as_millis() as u64,
+        error = %compact_error_detail(err),
+        "Provider attempt failed"
+    );
+}
+
 fn push_failure(
     failures: &mut Vec<String>,
     provider_name: &str,
@@ -231,6 +350,8 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Temporarily deprioritized models after repeated 429s.
+    model_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl ReliableProvider {
@@ -246,6 +367,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            model_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -267,7 +389,36 @@ impl ReliableProvider {
         if let Some(fallbacks) = self.model_fallbacks.get(model) {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
-        chain
+        self.reorder_models_by_cooldown(chain)
+    }
+
+    fn reorder_models_by_cooldown<'a>(&'a self, chain: Vec<&'a str>) -> Vec<&'a str> {
+        let mut cooldowns = self.model_cooldowns.lock();
+        let now = Instant::now();
+        cooldowns.retain(|_, until| *until > now);
+
+        let mut available = Vec::with_capacity(chain.len());
+        let mut cooled = Vec::new();
+        for model in chain {
+            if cooldowns.contains_key(model) {
+                cooled.push(model);
+            } else {
+                available.push(model);
+            }
+        }
+        available.extend(cooled);
+        available
+    }
+
+    fn note_rate_limit_cooldown(&self, model: &str) {
+        let cooldown_ms = RATE_LIMIT_COOLDOWN_BASE_MS + jitter_ms(RATE_LIMIT_COOLDOWN_JITTER_MS);
+        let until = Instant::now() + Duration::from_millis(cooldown_ms);
+        self.model_cooldowns.lock().insert(model.to_string(), until);
+        tracing::warn!(
+            model,
+            cooldown_ms,
+            "Model temporarily deprioritized after repeated rate limits"
+        );
     }
 
     /// Advance to the next API key and return it, or None if no extra keys configured.
@@ -281,12 +432,16 @@ impl ReliableProvider {
 
     /// Compute backoff duration, respecting Retry-After if present.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
-        if let Some(retry_after) = parse_retry_after_ms(err) {
+        let capped = if let Some(retry_after) = parse_retry_after_ms(err) {
             // Use Retry-After but cap at 30s to avoid indefinite waits
-            retry_after.min(30_000).max(base)
+            retry_after.min(MAX_RETRY_AFTER_MS).max(base)
         } else {
             base
-        }
+        };
+        let jitter_cap = (capped / BACKOFF_JITTER_DIVISOR).max(50);
+        capped
+            .saturating_add(jitter_ms(jitter_cap))
+            .min(MAX_RETRY_AFTER_MS)
     }
 }
 
@@ -319,13 +474,21 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let mut rate_limit_failures = 0u32;
 
                 for attempt in 0..=self.max_retries {
+                    let started = Instant::now();
                     match provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            log_attempt_success(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                started.elapsed(),
+                            );
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -341,8 +504,19 @@ impl Provider for ReliableProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            if rate_limited && !non_retryable_rate_limit {
+                                rate_limit_failures = rate_limit_failures.saturating_add(1);
+                            }
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            log_attempt_failure(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                &e,
+                                non_retryable,
+                                started.elapsed(),
+                            );
 
                             push_failure(
                                 &mut failures,
@@ -393,16 +567,22 @@ impl Provider for ReliableProvider {
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
+                                    status_code = ?status_code(&e),
+                                    error_category = error_category(&e, non_retryable),
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
                             }
                         }
                     }
+                }
+
+                if rate_limit_failures >= 2 {
+                    self.note_rate_limit_cooldown(current_model);
                 }
 
                 tracing::warn!(
@@ -439,13 +619,21 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let mut rate_limit_failures = 0u32;
 
                 for attempt in 0..=self.max_retries {
+                    let started = Instant::now();
                     match provider
                         .chat_with_history(messages, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            log_attempt_success(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                started.elapsed(),
+                            );
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -461,8 +649,19 @@ impl Provider for ReliableProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            if rate_limited && !non_retryable_rate_limit {
+                                rate_limit_failures = rate_limit_failures.saturating_add(1);
+                            }
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            log_attempt_failure(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                &e,
+                                non_retryable,
+                                started.elapsed(),
+                            );
 
                             push_failure(
                                 &mut failures,
@@ -511,16 +710,22 @@ impl Provider for ReliableProvider {
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
+                                    status_code = ?status_code(&e),
+                                    error_category = error_category(&e, non_retryable),
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
                             }
                         }
                     }
+                }
+
+                if rate_limit_failures >= 2 {
+                    self.note_rate_limit_cooldown(current_model);
                 }
 
                 tracing::warn!(
@@ -563,13 +768,21 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let mut rate_limit_failures = 0u32;
 
                 for attempt in 0..=self.max_retries {
+                    let started = Instant::now();
                     match provider
                         .chat_with_tools(messages, tools, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            log_attempt_success(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                started.elapsed(),
+                            );
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -585,8 +798,19 @@ impl Provider for ReliableProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            if rate_limited && !non_retryable_rate_limit {
+                                rate_limit_failures = rate_limit_failures.saturating_add(1);
+                            }
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            log_attempt_failure(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                &e,
+                                non_retryable,
+                                started.elapsed(),
+                            );
 
                             push_failure(
                                 &mut failures,
@@ -635,16 +859,22 @@ impl Provider for ReliableProvider {
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
+                                    status_code = ?status_code(&e),
+                                    error_category = error_category(&e, non_retryable),
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
                             }
                         }
                     }
+                }
+
+                if rate_limit_failures >= 2 {
+                    self.note_rate_limit_cooldown(current_model);
                 }
 
                 tracing::warn!(
@@ -673,14 +903,22 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
+                let mut rate_limit_failures = 0u32;
 
                 for attempt in 0..=self.max_retries {
                     let req = ChatRequest {
                         messages: request.messages,
                         tools: request.tools,
                     };
+                    let started = Instant::now();
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
+                            log_attempt_success(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                started.elapsed(),
+                            );
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = provider_name,
@@ -696,8 +934,19 @@ impl Provider for ReliableProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            if rate_limited && !non_retryable_rate_limit {
+                                rate_limit_failures = rate_limit_failures.saturating_add(1);
+                            }
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
+                            log_attempt_failure(
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                &e,
+                                non_retryable,
+                                started.elapsed(),
+                            );
 
                             push_failure(
                                 &mut failures,
@@ -746,16 +995,22 @@ impl Provider for ReliableProvider {
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
+                                    status_code = ?status_code(&e),
+                                    error_category = error_category(&e, non_retryable),
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
                                     "Provider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
-                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
                             }
                         }
                     }
+                }
+
+                if rate_limit_failures >= 2 {
+                    self.note_rate_limit_cooldown(current_model);
                 }
 
                 tracing::warn!(
@@ -1434,21 +1689,23 @@ mod tests {
     fn compute_backoff_uses_retry_after() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
-        assert_eq!(provider.compute_backoff(500, &err), 3_000);
+        let wait = provider.compute_backoff(500, &err);
+        assert!((3_000..=3_750).contains(&wait));
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 120");
-        assert_eq!(provider.compute_backoff(500, &err), 30_000);
+        assert_eq!(provider.compute_backoff(500, &err), MAX_RETRY_AFTER_MS);
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
-        assert_eq!(provider.compute_backoff(500, &err), 500);
+        let wait = provider.compute_backoff(500, &err);
+        assert!((500..=625).contains(&wait));
     }
 
     // ── §2.1 API auth error (401/403) tests ──────────────────
@@ -1979,5 +2236,52 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn model_chain_moves_cooled_models_to_the_end() {
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "qwen/qwen3-coder:free".to_string(),
+            vec![
+                "deepseek/deepseek-r1-0528:free".to_string(),
+                "qwen/qwen3-32b:free".to_string(),
+            ],
+        );
+
+        let provider = ReliableProvider::new(vec![], 0, 500).with_model_fallbacks(fallbacks);
+        provider.note_rate_limit_cooldown("deepseek/deepseek-r1-0528:free");
+
+        let chain = provider.model_chain("qwen/qwen3-coder:free");
+        assert_eq!(
+            chain,
+            vec![
+                "qwen/qwen3-coder:free",
+                "qwen/qwen3-32b:free",
+                "deepseek/deepseek-r1-0528:free",
+            ]
+        );
+    }
+
+    #[test]
+    fn error_category_detects_empty_timeout_and_malformed_responses() {
+        assert_eq!(
+            error_category(&anyhow::anyhow!("No response from OpenRouter"), false),
+            "empty_response"
+        );
+        assert_eq!(
+            error_category(
+                &anyhow::anyhow!("request timeout while waiting for upstream"),
+                false
+            ),
+            "timeout"
+        );
+        assert_eq!(
+            error_category(
+                &anyhow::anyhow!("error decoding response body: expected value"),
+                false
+            ),
+            "malformed_response"
+        );
     }
 }
