@@ -208,14 +208,11 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
+        Ok(response) if response.trim().is_empty() => (
+            false,
+            "agent job produced no output (possible silent failure)".to_string(),
         ),
+        Ok(response) => (true, response),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
 }
