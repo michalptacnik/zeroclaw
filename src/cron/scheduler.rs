@@ -31,6 +31,10 @@ pub async fn run(config: Config) -> Result<()> {
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
+    // On startup, sweep any runs left in 'running' state from a previous
+    // unclean shutdown and re-queue jobs that were missed.
+    sweep_and_detect_on_startup(&config);
+
     loop {
         interval.tick().await;
         // Keep scheduler liveness fresh even when there are no due jobs.
@@ -323,6 +327,88 @@ async fn persist_job_result_no_record(
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+}
+
+/// Sweep interrupted runs and log any jobs whose scheduled window was missed.
+///
+/// Called once at scheduler startup.  All operations are best-effort — errors
+/// are logged as warnings and do not prevent the scheduler from running.
+fn sweep_and_detect_on_startup(config: &Config) {
+    let now = Utc::now();
+
+    // 1. Mark any runs left in 'running' state as 'interrupted'.
+    match sweep_interrupted_runs(config) {
+        Ok(interrupted) => {
+            for (run_id, job_id, started_at) in &interrupted {
+                tracing::warn!(
+                    job_id,
+                    %started_at,
+                    "Found interrupted cron run from previous daemon shutdown"
+                );
+                if let Err(e) = mark_run_interrupted(config, *run_id, now) {
+                    tracing::warn!(job_id, "Failed to mark run as interrupted: {e}");
+                }
+            }
+            if !interrupted.is_empty() {
+                tracing::info!(count = interrupted.len(), "Swept interrupted cron runs");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to sweep interrupted cron runs: {e}");
+        }
+    }
+
+    // 2. Detect jobs that were due but never started (missed while daemon was down).
+    detect_missed_jobs(config, now);
+}
+
+/// Log a warning for each enabled job whose `next_run` is in the past by more
+/// than `scheduler.missed_job_grace_secs`.
+///
+/// This is informational only — the normal `due_jobs` poll will still pick up
+/// overdue jobs on the next tick.
+fn detect_missed_jobs(config: &Config, now: DateTime<Utc>) {
+    let grace_secs = config.scheduler.missed_job_grace_secs;
+
+    let jobs = match crate::cron::list_jobs(config) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("detect_missed_jobs: failed to list jobs: {e}");
+            return;
+        }
+    };
+
+    let mut missed = 0u32;
+    for job in &jobs {
+        if !job.enabled {
+            continue;
+        }
+        let overdue_secs = (now - job.next_run).num_seconds();
+        if overdue_secs <= 0 {
+            continue;
+        }
+
+        // Within grace period — normal scheduler will handle it shortly.
+        if grace_secs > 0 && (overdue_secs as u64) <= grace_secs {
+            continue;
+        }
+
+        let name = job.name.as_deref().unwrap_or(&job.id);
+        tracing::warn!(
+            job_id = %job.id,
+            job_name = name,
+            overdue_secs,
+            "Missed cron job detected at startup"
+        );
+        missed += 1;
+    }
+
+    if missed > 0 {
+        tracing::warn!(
+            missed,
+            "Missed cron jobs detected; they will be executed on the next scheduler tick"
+        );
+    }
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
