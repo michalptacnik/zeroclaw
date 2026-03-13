@@ -1,4 +1,5 @@
 pub mod pid;
+pub mod preflight;
 
 use crate::config::Config;
 use anyhow::Result;
@@ -55,6 +56,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+
+    // Best-effort preflight checks — warnings only, never block startup.
+    preflight::run_preflight_checks(&config);
 
     if config.heartbeat.enabled {
         let _ =
