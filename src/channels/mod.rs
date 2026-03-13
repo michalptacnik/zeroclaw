@@ -180,6 +180,7 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+const CHANNEL_HEALTH_CHECK_INTERVAL_SECS: u64 = 120;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -1526,6 +1527,7 @@ fn spawn_supervised_listener(
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised_listener_with_health_interval(
         ch,
@@ -1533,6 +1535,7 @@ fn spawn_supervised_listener(
         initial_backoff_secs,
         max_backoff_secs,
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        shutdown_token,
     )
 }
 
@@ -1542,6 +1545,7 @@ fn spawn_supervised_listener_with_health_interval(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
+    shutdown_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let health_interval = if health_interval.is_zero() {
         Duration::from_secs(1)
@@ -1568,9 +1572,21 @@ fn spawn_supervised_listener_with_health_interval(
                             crate::health::mark_component_ok(&component);
                         }
                         result = &mut listen_future => break result,
+                        _ = shutdown_token.cancelled() => {
+                            tracing::debug!(
+                                "Channel listener '{}' exiting due to shutdown token",
+                                ch.name()
+                            );
+                            return;
+                        }
                     }
                 }
             };
+
+            // Honour shutdown before deciding to restart.
+            if shutdown_token.is_cancelled() {
+                return;
+            }
 
             if tx.is_closed() {
                 break;
@@ -1590,9 +1606,66 @@ fn spawn_supervised_listener_with_health_interval(
             }
 
             crate::health::bump_component_restart(&component);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                _ = shutdown_token.cancelled() => {
+                    tracing::debug!("Channel '{}' backoff interrupted by shutdown", ch.name());
+                    return;
+                }
+            }
+
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    })
+}
+
+/// Spawn a background task that periodically calls `health_check()` on a
+/// channel.  If the check fails, the per-channel `channel_token` is cancelled
+/// so the supervised listener restarts.
+fn spawn_channel_health_watcher(
+    ch: Arc<dyn Channel>,
+    channel_token: CancellationToken,
+    shutdown_token: CancellationToken,
+    check_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let check_interval = if check_interval.is_zero() {
+        Duration::from_secs(60)
+    } else {
+        check_interval
+    };
+
+    tokio::spawn(async move {
+        let component = format!("channel:{}", ch.name());
+        let mut interval = tokio::time::interval(check_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if !ch.health_check().await {
+                        tracing::warn!(
+                            channel = ch.name(),
+                            "Channel health check failed — triggering restart"
+                        );
+                        crate::health::mark_component_error(
+                            &component,
+                            "health check failed",
+                        );
+                        // Cancel the channel-specific token to force a restart.
+                        channel_token.cancel();
+                        // Re-arm the watcher: child tokens are not reusable, so
+                        // the supervisor creates a new one on each restart.
+                        return;
+                    } else {
+                        crate::health::mark_component_ok(&component);
+                    }
+                }
+                _ = shutdown_token.cancelled() => {
+                    return;
+                }
+            }
         }
     })
 }
@@ -3467,17 +3540,30 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .channel_max_backoff_secs
         .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
+    // Shutdown token — cancelled when start_channels() is asked to stop.
+    let shutdown_token = CancellationToken::new();
+
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
 
-    // Spawn a listener for each channel
+    // Spawn a supervised listener + health watcher for each channel.
     let mut handles = Vec::new();
     for ch in &channels {
+        // Per-channel token: the health watcher cancels this to force a
+        // listener restart without touching the global shutdown token.
+        let channel_token = shutdown_token.child_token();
         handles.push(spawn_supervised_listener(
             ch.clone(),
             tx.clone(),
             initial_backoff_secs,
             max_backoff_secs,
+            channel_token.clone(),
+        ));
+        handles.push(spawn_channel_health_watcher(
+            ch.clone(),
+            channel_token,
+            shutdown_token.clone(),
+            Duration::from_secs(CHANNEL_HEALTH_CHECK_INTERVAL_SECS),
         ));
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
@@ -3545,6 +3631,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+
+    // Signal all channel listeners and health watchers to stop.
+    shutdown_token.cancel();
 
     // Wait for all channel tasks
     for h in handles {
@@ -6542,7 +6631,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, tx, 1, 1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, CancellationToken::new());
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
@@ -6577,6 +6666,7 @@ This is an example JSON object for profile settings."#;
             1,
             1,
             Duration::from_millis(20),
+            CancellationToken::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
