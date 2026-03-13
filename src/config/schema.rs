@@ -229,6 +229,10 @@ pub struct Config {
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// Daemon process configuration (`[daemon]`).
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -2414,6 +2418,31 @@ impl Default for RuntimeConfig {
     }
 }
 
+// ── Daemon ────────────────────────────────────────────────────────
+
+/// Daemon process configuration (`[daemon]` section).
+///
+/// Controls process-level behaviour such as graceful shutdown drain timing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonConfig {
+    /// Seconds to wait for in-flight work to finish after a shutdown signal before
+    /// forcibly aborting tasks.  Minimum effective value: 1.  Default: 30.
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+}
+
+fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+        }
+    }
+}
+
 // ── Reliability / supervision ────────────────────────────────────
 
 /// Reliability and supervision configuration (`[reliability]` section).
@@ -2450,6 +2479,14 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// Number of consecutive provider-level failures that trips the provider circuit breaker.
+    /// Set to 0 to disable.  Default: 5.
+    #[serde(default = "default_provider_circuit_breaker_threshold")]
+    pub provider_circuit_breaker_threshold: u32,
+    /// Minutes the provider circuit breaker stays open (cooling down) after being tripped.
+    /// Default: 5.
+    #[serde(default = "default_provider_circuit_breaker_cooldown_mins")]
+    pub provider_circuit_breaker_cooldown_mins: u64,
 }
 
 fn default_provider_retries() -> u32 {
@@ -2476,6 +2513,14 @@ fn default_scheduler_retries() -> u32 {
     2
 }
 
+fn default_provider_circuit_breaker_threshold() -> u32 {
+    5
+}
+
+fn default_provider_circuit_breaker_cooldown_mins() -> u64 {
+    5
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -2488,6 +2533,8 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            provider_circuit_breaker_threshold: default_provider_circuit_breaker_threshold(),
+            provider_circuit_breaker_cooldown_mins: default_provider_circuit_breaker_cooldown_mins(),
         }
     }
 }
@@ -2506,6 +2553,14 @@ pub struct SchedulerConfig {
     /// Maximum tasks executed per scheduler polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Grace period in seconds before a job interrupted at daemon startup is considered
+    /// missed and re-run.  Set to 0 to always re-run interrupted jobs.  Default: 300 (5 min).
+    #[serde(default = "default_missed_job_grace_secs")]
+    pub missed_job_grace_secs: u64,
+    /// Number of consecutive failures before a per-job circuit breaker is tripped and the
+    /// job is temporarily skipped.  Set to 0 to disable.  Default: 5.
+    #[serde(default = "default_job_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -2520,12 +2575,22 @@ fn default_scheduler_max_concurrent() -> usize {
     4
 }
 
+fn default_missed_job_grace_secs() -> u64 {
+    300
+}
+
+fn default_job_circuit_breaker_threshold() -> u32 {
+    5
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
+            missed_job_grace_secs: default_missed_job_grace_secs(),
+            circuit_breaker_threshold: default_job_circuit_breaker_threshold(),
         }
     }
 }
@@ -3990,6 +4055,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
