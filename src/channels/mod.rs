@@ -909,6 +909,82 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
+// ── Conversation history persistence ─────────────────────────────────────
+
+/// Memory key prefix for persisted conversation histories.
+const HISTORY_KEY_PREFIX: &str = "ch_hist";
+/// Persist a checkpoint after this many appended messages per sender.
+const HISTORY_PERSIST_INTERVAL: usize = 10;
+
+/// Persist a single sender's history to the Memory backend (best-effort).
+async fn persist_conversation_history(
+    memory: &Arc<dyn Memory>,
+    key: &str,
+    history: &[ChatMessage],
+) {
+    let Ok(json) = serde_json::to_string(history) else {
+        return;
+    };
+    if let Err(e) = memory
+        .store(key, &json, crate::memory::MemoryCategory::Conversation, None)
+        .await
+    {
+        tracing::warn!(key, "Failed to persist conversation history: {e}");
+    }
+}
+
+/// Load all persisted conversation histories from the Memory backend.
+///
+/// Entries are stored under keys with the `ch_hist:` prefix followed by
+/// `channel:sender`.  Malformed entries are skipped with a warning.
+async fn load_conversation_histories(memory: &Arc<dyn Memory>) -> HashMap<String, Vec<ChatMessage>> {
+    let mut out: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+    let prefix = HISTORY_KEY_PREFIX;
+    let entries = match memory.recall(prefix, 256, None).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Failed to load conversation histories: {e}");
+            return out;
+        }
+    };
+    for entry in &entries {
+        // Only process entries whose key starts with our prefix.
+        if !entry.key.starts_with(&format!("{prefix}:")) {
+            continue;
+        }
+        match serde_json::from_str::<Vec<ChatMessage>>(&entry.content) {
+            Ok(history) if !history.is_empty() => {
+                out.insert(entry.key.clone(), history);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(key = %entry.key, "Skipping malformed conversation history: {e}");
+            }
+        }
+    }
+    if !out.is_empty() {
+        tracing::info!(count = out.len(), "Restored conversation histories from memory");
+    }
+    out
+}
+
+/// Flush all in-memory conversation histories to the Memory backend.
+///
+/// Best-effort: individual failures are logged but do not abort the loop.
+async fn checkpoint_all_histories(memory: &Arc<dyn Memory>, histories: &ConversationHistoryMap) {
+    let snapshot: Vec<(String, Vec<ChatMessage>)> = histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    for (key, history) in &snapshot {
+        let store_key = format!("{HISTORY_KEY_PREFIX}:{key}");
+        persist_conversation_history(memory, &store_key, history).await;
+    }
+}
+
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -2176,6 +2252,33 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Periodic fire-and-forget history checkpoint.
+            {
+                let history_len = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&history_key)
+                    .map(|h| h.len())
+                    .unwrap_or(0);
+                if history_len > 0 && history_len % HISTORY_PERSIST_INTERVAL == 0 {
+                    let history_snapshot = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&history_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mem_clone = Arc::clone(&ctx.memory);
+                    let store_key = format!("{HISTORY_KEY_PREFIX}:{history_key}");
+                    tokio::spawn(async move {
+                        persist_conversation_history(&mem_clone, &store_key, &history_snapshot)
+                            .await;
+                    });
+                }
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3601,7 +3704,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        // Restore persisted conversation histories from the memory backend so
+        // sessions survive daemon restarts.
+        conversation_histories: Arc::new(Mutex::new(
+            load_conversation_histories(&mem).await,
+        )),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -3630,7 +3737,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.model_routes.clone()),
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(rx, Arc::clone(&runtime_ctx), max_in_flight_messages).await;
+
+    // Persist all conversation histories so they survive the next restart.
+    tracing::info!("Checkpointing conversation histories before shutdown");
+    checkpoint_all_histories(&runtime_ctx.memory, &runtime_ctx.conversation_histories).await;
 
     // Signal all channel listeners and health watchers to stop.
     shutdown_token.cancel();
