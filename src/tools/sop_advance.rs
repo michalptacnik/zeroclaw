@@ -94,6 +94,7 @@ impl Tool for SopAdvanceTool {
                     error: Some(format!(
                         "Invalid status '{other}'. Must be: completed, failed, or skipped"
                     )),
+                metadata: None,
                 });
             }
         };
@@ -186,12 +187,14 @@ impl Tool for SopAdvanceTool {
                     success: true,
                     output: result_output,
                     error: None,
+                metadata: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to advance step: {e}")),
+            metadata: None,
             }),
         }
     }

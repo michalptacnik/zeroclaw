@@ -77,6 +77,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Filename contains characters unsafe for shell execution".into()),
+                metadata: None,
             });
         }
 
@@ -88,6 +89,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Screenshot not supported on this platform".into()),
+                metadata: None,
             });
         };
 
@@ -123,12 +125,14 @@ impl ScreenshotTool {
                                 "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick."
                                     .into(),
                             ),
+                        metadata: None,
                         });
                     }
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Screenshot command failed: {stderr}")),
+                        metadata: None,
                     });
                 }
 
@@ -138,6 +142,7 @@ impl ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute screenshot command: {e}")),
+                metadata: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -145,6 +150,7 @@ impl ScreenshotTool {
                 error: Some(format!(
                     "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
                 )),
+                metadata: None,
             }),
         }
     }
@@ -163,6 +169,7 @@ impl ScreenshotTool {
                         meta.len(),
                     ),
                     error: None,
+                metadata: None,
                 });
             }
         }
@@ -204,12 +211,14 @@ impl ScreenshotTool {
                     success: true,
                     output: output_msg,
                     error: None,
+                    metadata: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: format!("Screenshot saved to: {}", output_path.display()),
                 error: Some(format!("Failed to read screenshot file: {e}")),
+                metadata: None,
             }),
         }
     }
@@ -247,6 +256,7 @@ impl Tool for ScreenshotTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                metadata: None,
             });
         }
         self.capture(args).await

@@ -702,12 +702,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        metadata: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list actions: {e}")),
+                    metadata: None,
                     }),
                 }
             }
@@ -727,6 +729,7 @@ impl Tool for ComposioTool {
                                     "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
                                 ),
                                 error: None,
+                            metadata: None,
                             });
                         }
 
@@ -752,12 +755,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        metadata: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list connected accounts: {e}")),
+                    metadata: None,
                     }),
                 }
             }
@@ -771,6 +776,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                    metadata: None,
                     });
                 }
 
@@ -805,6 +811,7 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        metadata: None,
                         })
                     }
                     Err(e) => {
@@ -822,6 +829,7 @@ impl Tool for ComposioTool {
                             error: Some(format!(
                                 "Action execution failed: {e}{schema_hint}"
                             )),
+                        metadata: None,
                         })
                     }
                 }
@@ -836,6 +844,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                    metadata: None,
                     });
                 }
 
@@ -867,12 +876,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                        metadata: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to get connection URL: {e}")),
+                    metadata: None,
                     }),
                 }
             }
@@ -883,6 +894,7 @@ impl Tool for ComposioTool {
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'list_accounts', 'execute', or 'connect'."
                 )),
+            metadata: None,
             }),
         }
     }

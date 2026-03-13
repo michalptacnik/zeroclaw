@@ -44,6 +44,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                metadata: None,
             });
         }
 
@@ -52,6 +53,7 @@ impl ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                metadata: None,
             });
         }
 
@@ -149,6 +151,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            metadata: None,
         })
     }
 
@@ -165,6 +168,7 @@ impl ProxyConfigTool {
                 }
             }))?,
             error: None,
+            metadata: None,
         })
     }
 
@@ -262,6 +266,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            metadata: None,
         })
     }
 
@@ -289,6 +294,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            metadata: None,
         })
     }
 
@@ -319,6 +325,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            metadata: None,
         })
     }
 
@@ -331,6 +338,7 @@ impl ProxyConfigTool {
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
+            metadata: None,
         })
     }
 }
@@ -430,6 +438,7 @@ impl Tool for ProxyConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
+                metadata: None,
             }),
         }
     }

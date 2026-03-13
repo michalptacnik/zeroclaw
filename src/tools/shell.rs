@@ -100,6 +100,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                metadata: None,
             });
         }
 
@@ -110,6 +111,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
+                    metadata: None,
                 });
             }
         }
@@ -119,6 +121,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+                metadata: None,
             });
         }
 
@@ -127,6 +130,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                metadata: None,
             });
         }
 
@@ -143,6 +147,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    metadata: None,
                 });
             }
         };
@@ -188,12 +193,14 @@ impl Tool for ShellTool {
                     } else {
                         Some(stderr)
                     },
+                    metadata: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
+                metadata: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -201,6 +208,7 @@ impl Tool for ShellTool {
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
+                metadata: None,
             }),
         }
     }

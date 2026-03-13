@@ -434,8 +434,8 @@ impl Agent {
 
         ToolExecutionResult {
             name: call.name.clone(),
-            output: result,
-            success: true,
+            output: rendered,
+            success,
             tool_call_id: call.tool_call_id.clone(),
             proof,
         }
@@ -816,6 +816,7 @@ mod tests {
                 success: true,
                 output: "tool-out".into(),
                 error: None,
+                metadata: None,
             })
         }
     }
