@@ -354,6 +354,114 @@ pub fn record_run(
     })
 }
 
+/// Insert a sentinel row marking a job as currently running.
+///
+/// Returns the `cron_runs.id` of the inserted row, which should be passed to
+/// [`complete_run`] when the job finishes.  The `finished_at` is stored as
+/// the same value as `started_at` (a placeholder) and is overwritten by
+/// `complete_run`.
+pub fn insert_running_run(config: &Config, job_id: &str, started_at: DateTime<Utc>) -> Result<i64> {
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES (?1, ?2, ?3, 'running', NULL, NULL)",
+            params![job_id, started_at.to_rfc3339(), started_at.to_rfc3339()],
+        )
+        .context("Failed to insert running cron run")?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// Update a running-state row (inserted by [`insert_running_run`]) to its
+/// final status.  Also prunes history for the job.
+pub fn complete_run(
+    config: &Config,
+    run_id: i64,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+    with_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute(
+            "UPDATE cron_runs
+             SET finished_at = ?1, status = ?2, output = ?3, duration_ms = ?4
+             WHERE id = ?5",
+            params![
+                finished_at.to_rfc3339(),
+                status,
+                bounded_output.as_deref(),
+                duration_ms,
+                run_id,
+            ],
+        )
+        .context("Failed to complete cron run")?;
+
+        let keep = i64::from(config.cron.max_run_history.max(1));
+        tx.execute(
+            "DELETE FROM cron_runs
+             WHERE job_id = ?1
+               AND status != 'running'
+               AND id NOT IN (
+                 SELECT id FROM cron_runs
+                 WHERE job_id = ?1 AND status != 'running'
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT ?2
+               )",
+            params![job_id, keep],
+        )
+        .context("Failed to prune cron run history")?;
+
+        tx.commit()
+            .context("Failed to commit complete_run transaction")?;
+        Ok(())
+    })
+}
+
+/// Return all runs that still have `status = 'running'` — i.e. jobs that
+/// were in-flight when the daemon last exited without a clean shutdown.
+///
+/// Each entry is `(run_id, job_id, started_at)`.
+pub fn sweep_interrupted_runs(config: &Config) -> Result<Vec<(i64, String, DateTime<Utc>)>> {
+    with_connection(config, |conn| {
+        let mut stmt =
+            conn.prepare("SELECT id, job_id, started_at FROM cron_runs WHERE status = 'running'")?;
+        let rows = stmt.query_map([], |row| {
+            let run_id: i64 = row.get(0)?;
+            let job_id: String = row.get(1)?;
+            let started_at_raw: String = row.get(2)?;
+            let started_at = parse_rfc3339(&started_at_raw).map_err(sql_conversion_error)?;
+            Ok((run_id, job_id, started_at))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    })
+}
+
+/// Mark an interrupted run (status = 'running') as having been cut short by a
+/// daemon restart, so it no longer blocks missed-job detection.
+pub fn mark_run_interrupted(
+    config: &Config,
+    run_id: i64,
+    finished_at: DateTime<Utc>,
+) -> Result<()> {
+    with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_runs SET finished_at = ?1, status = 'interrupted' WHERE id = ?2",
+            params![finished_at.to_rfc3339(), run_id],
+        )
+        .context("Failed to mark cron run as interrupted")?;
+        Ok(())
+    })
+}
+
 fn truncate_cron_output(output: &str) -> String {
     if output.len() <= MAX_CRON_OUTPUT_BYTES {
         return output.to_string();

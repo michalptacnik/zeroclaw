@@ -180,6 +180,7 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+const CHANNEL_HEALTH_CHECK_INTERVAL_SECS: u64 = 120;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -908,6 +909,92 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
+// ── Conversation history persistence ─────────────────────────────────────
+
+/// Memory key prefix for persisted conversation histories.
+const HISTORY_KEY_PREFIX: &str = "ch_hist";
+/// Persist a checkpoint after this many appended messages per sender.
+const HISTORY_PERSIST_INTERVAL: usize = 10;
+
+/// Persist a single sender's history to the Memory backend (best-effort).
+async fn persist_conversation_history(
+    memory: &Arc<dyn Memory>,
+    key: &str,
+    history: &[ChatMessage],
+) {
+    let Ok(json) = serde_json::to_string(history) else {
+        return;
+    };
+    if let Err(e) = memory
+        .store(
+            key,
+            &json,
+            crate::memory::MemoryCategory::Conversation,
+            None,
+        )
+        .await
+    {
+        tracing::warn!(key, "Failed to persist conversation history: {e}");
+    }
+}
+
+/// Load all persisted conversation histories from the Memory backend.
+///
+/// Entries are stored under keys with the `ch_hist:` prefix followed by
+/// `channel:sender`.  Malformed entries are skipped with a warning.
+async fn load_conversation_histories(
+    memory: &Arc<dyn Memory>,
+) -> HashMap<String, Vec<ChatMessage>> {
+    let mut out: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+    let prefix = HISTORY_KEY_PREFIX;
+    let entries = match memory.recall(prefix, 256, None).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Failed to load conversation histories: {e}");
+            return out;
+        }
+    };
+    for entry in &entries {
+        // Only process entries whose key starts with our prefix.
+        if !entry.key.starts_with(&format!("{prefix}:")) {
+            continue;
+        }
+        match serde_json::from_str::<Vec<ChatMessage>>(&entry.content) {
+            Ok(history) if !history.is_empty() => {
+                out.insert(entry.key.clone(), history);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(key = %entry.key, "Skipping malformed conversation history: {e}");
+            }
+        }
+    }
+    if !out.is_empty() {
+        tracing::info!(
+            count = out.len(),
+            "Restored conversation histories from memory"
+        );
+    }
+    out
+}
+
+/// Flush all in-memory conversation histories to the Memory backend.
+///
+/// Best-effort: individual failures are logged but do not abort the loop.
+async fn checkpoint_all_histories(memory: &Arc<dyn Memory>, histories: &ConversationHistoryMap) {
+    let snapshot: Vec<(String, Vec<ChatMessage>)> = histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    for (key, history) in &snapshot {
+        let store_key = format!("{HISTORY_KEY_PREFIX}:{key}");
+        persist_conversation_history(memory, &store_key, history).await;
+    }
+}
+
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -1526,6 +1613,7 @@ fn spawn_supervised_listener(
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised_listener_with_health_interval(
         ch,
@@ -1533,6 +1621,7 @@ fn spawn_supervised_listener(
         initial_backoff_secs,
         max_backoff_secs,
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        shutdown_token,
     )
 }
 
@@ -1542,6 +1631,7 @@ fn spawn_supervised_listener_with_health_interval(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
+    shutdown_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let health_interval = if health_interval.is_zero() {
         Duration::from_secs(1)
@@ -1568,9 +1658,21 @@ fn spawn_supervised_listener_with_health_interval(
                             crate::health::mark_component_ok(&component);
                         }
                         result = &mut listen_future => break result,
+                        () = shutdown_token.cancelled() => {
+                            tracing::debug!(
+                                "Channel listener '{}' exiting due to shutdown token",
+                                ch.name()
+                            );
+                            return;
+                        }
                     }
                 }
             };
+
+            // Honour shutdown before deciding to restart.
+            if shutdown_token.is_cancelled() {
+                return;
+            }
 
             if tx.is_closed() {
                 break;
@@ -1590,9 +1692,66 @@ fn spawn_supervised_listener_with_health_interval(
             }
 
             crate::health::bump_component_restart(&component);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!("Channel '{}' backoff interrupted by shutdown", ch.name());
+                    return;
+                }
+            }
+
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    })
+}
+
+/// Spawn a background task that periodically calls `health_check()` on a
+/// channel.  If the check fails, the per-channel `channel_token` is cancelled
+/// so the supervised listener restarts.
+fn spawn_channel_health_watcher(
+    ch: Arc<dyn Channel>,
+    channel_token: CancellationToken,
+    shutdown_token: CancellationToken,
+    check_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let check_interval = if check_interval.is_zero() {
+        Duration::from_secs(60)
+    } else {
+        check_interval
+    };
+
+    tokio::spawn(async move {
+        let component = format!("channel:{}", ch.name());
+        let mut interval = tokio::time::interval(check_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if ch.health_check().await {
+                        crate::health::mark_component_ok(&component);
+                    } else {
+                        tracing::warn!(
+                            channel = ch.name(),
+                            "Channel health check failed — triggering restart"
+                        );
+                        crate::health::mark_component_error(
+                            &component,
+                            "health check failed",
+                        );
+                        // Cancel the channel-specific token to force a restart.
+                        channel_token.cancel();
+                        // Re-arm the watcher: child tokens are not reusable, so
+                        // the supervisor creates a new one on each restart.
+                        return;
+                    }
+                }
+                () = shutdown_token.cancelled() => {
+                    return;
+                }
+            }
         }
     })
 }
@@ -2103,6 +2262,33 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Periodic fire-and-forget history checkpoint.
+            {
+                let history_len = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&history_key)
+                    .map(|h| h.len())
+                    .unwrap_or(0);
+                if history_len > 0 && history_len.is_multiple_of(HISTORY_PERSIST_INTERVAL) {
+                    let history_snapshot = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&history_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mem_clone = Arc::clone(&ctx.memory);
+                    let store_key = format!("{HISTORY_KEY_PREFIX}:{history_key}");
+                    tokio::spawn(async move {
+                        persist_conversation_history(&mem_clone, &store_key, &history_snapshot)
+                            .await;
+                    });
+                }
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3467,17 +3653,30 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .channel_max_backoff_secs
         .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
+    // Shutdown token — cancelled when start_channels() is asked to stop.
+    let shutdown_token = CancellationToken::new();
+
     // Single message bus — all channels send messages here
     let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
 
-    // Spawn a listener for each channel
+    // Spawn a supervised listener + health watcher for each channel.
     let mut handles = Vec::new();
     for ch in &channels {
+        // Per-channel token: the health watcher cancels this to force a
+        // listener restart without touching the global shutdown token.
+        let channel_token = shutdown_token.child_token();
         handles.push(spawn_supervised_listener(
             ch.clone(),
             tx.clone(),
             initial_backoff_secs,
             max_backoff_secs,
+            channel_token.clone(),
+        ));
+        handles.push(spawn_channel_health_watcher(
+            ch.clone(),
+            channel_token,
+            shutdown_token.clone(),
+            Duration::from_secs(CHANNEL_HEALTH_CHECK_INTERVAL_SECS),
         ));
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
@@ -3515,7 +3714,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        // Restore persisted conversation histories from the memory backend so
+        // sessions survive daemon restarts.
+        conversation_histories: Arc::new(Mutex::new(load_conversation_histories(&mem).await)),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -3544,7 +3745,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.model_routes.clone()),
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(rx, Arc::clone(&runtime_ctx), max_in_flight_messages).await;
+
+    // Persist all conversation histories so they survive the next restart.
+    tracing::info!("Checkpointing conversation histories before shutdown");
+    checkpoint_all_histories(&runtime_ctx.memory, &runtime_ctx.conversation_histories).await;
+
+    // Signal all channel listeners and health watchers to stop.
+    shutdown_token.cancel();
 
     // Wait for all channel tasks
     for h in handles {
@@ -6542,7 +6750,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, tx, 1, 1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, CancellationToken::new());
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
@@ -6577,6 +6785,7 @@ This is an example JSON object for profile settings."#;
             1,
             1,
             Duration::from_millis(20),
+            CancellationToken::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;

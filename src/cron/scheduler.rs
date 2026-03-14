@@ -3,13 +3,15 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
+    complete_run, due_jobs, insert_running_run, mark_run_interrupted, next_run_for_schedule,
+    record_last_run, record_run, remove_job, reschedule_after_run, sweep_interrupted_runs,
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -18,6 +20,47 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+
+/// In-memory per-job circuit breaker state.
+///
+/// Tracks consecutive failures per job ID.  When a job's failure count
+/// reaches `scheduler.circuit_breaker_threshold` it is skipped on subsequent
+/// poll ticks with a warning.  The counter resets to 0 on the first success.
+#[derive(Default)]
+struct JobCircuitBreaker {
+    consecutive_failures: HashMap<String, u32>,
+}
+
+impl JobCircuitBreaker {
+    /// Returns `true` if the job should be skipped (circuit open).
+    fn is_open(&self, job_id: &str, threshold: u32) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        self.consecutive_failures.get(job_id).copied().unwrap_or(0) >= threshold
+    }
+
+    /// Record a successful run — resets the failure counter.
+    fn record_success(&mut self, job_id: &str) {
+        self.consecutive_failures.remove(job_id);
+    }
+
+    /// Record a failed run — increments the failure counter.
+    fn record_failure(&mut self, job_id: &str) -> u32 {
+        let count = self
+            .consecutive_failures
+            .entry(job_id.to_string())
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Manually reset a job's circuit breaker (e.g. after a config change).
+    #[cfg(test)]
+    fn reset(&mut self, job_id: &str) {
+        self.consecutive_failures.remove(job_id);
+    }
+}
 
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -29,6 +72,12 @@ pub async fn run(config: Config) -> Result<()> {
     ));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+
+    // On startup, sweep any runs left in 'running' state from a previous
+    // unclean shutdown and re-queue jobs that were missed.
+    sweep_and_detect_on_startup(&config);
+
+    let mut circuit_breaker = JobCircuitBreaker::default();
 
     loop {
         interval.tick().await;
@@ -44,7 +93,14 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(
+            &config,
+            &security,
+            jobs,
+            SCHEDULER_COMPONENT,
+            &mut circuit_breaker,
+        )
+        .await;
     }
 }
 
@@ -93,14 +149,38 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    circuit_breaker: &mut JobCircuitBreaker,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
+    let threshold = config.scheduler.circuit_breaker_threshold;
     let max_concurrent = config.scheduler.max_concurrent.max(1);
+
+    // Filter out jobs whose circuit breaker is open before dispatching.
+    let (runnable, skipped): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|job| !circuit_breaker.is_open(&job.id, threshold));
+
+    for job in &skipped {
+        let failures = circuit_breaker
+            .consecutive_failures
+            .get(&job.id)
+            .copied()
+            .unwrap_or(0);
+        let name = job.name.as_deref().unwrap_or(&job.id);
+        tracing::warn!(
+            job_id = %job.id,
+            job_name = name,
+            consecutive_failures = failures,
+            threshold,
+            "Skipping cron job — circuit breaker open"
+        );
+    }
+
     let mut in_flight =
         stream::iter(
-            jobs.into_iter().map(|job| {
+            runnable.into_iter().map(|job| {
                 let config = config.clone();
                 let security = Arc::clone(security);
                 let component = component.to_owned();
@@ -112,8 +192,19 @@ async fn process_due_jobs(
         .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success, output)) = in_flight.next().await {
-        if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
+        if success {
+            circuit_breaker.record_success(&job_id);
+        } else {
+            let failures = circuit_breaker.record_failure(&job_id);
+            tracing::warn!("Scheduler job '{job_id}' failed (consecutive={failures}): {output}");
+            if threshold > 0 && failures >= threshold {
+                tracing::warn!(
+                    job_id = %job_id,
+                    failures,
+                    threshold,
+                    "Cron job circuit breaker tripped — job will be skipped on next ticks"
+                );
+            }
         }
     }
 }
@@ -128,10 +219,57 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
+
+    // Record a "running" sentinel so we can detect interrupted jobs on next
+    // daemon startup.  Failure to record is non-fatal.
+    let run_id = insert_running_run(config, &job.id, started_at)
+        .map_err(|e| tracing::warn!("Failed to insert running run for '{}': {e}", job.id))
+        .ok();
+
     let (success, output) = execute_job_with_retry(config, security, job).await;
     let finished_at = Utc::now();
-    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+    let duration_ms = (finished_at - started_at).num_milliseconds();
 
+    // Complete the running sentinel (or fall back to the legacy record_run path).
+    if let Some(rid) = run_id {
+        let status = if success { "ok" } else { "error" };
+        if let Err(e) = complete_run(
+            config,
+            rid,
+            &job.id,
+            finished_at,
+            status,
+            Some(&output),
+            duration_ms,
+        ) {
+            tracing::warn!("Failed to complete run record for '{}': {e}", job.id);
+            // Fallback: use legacy path so history is not lost entirely.
+            let _ = record_run(
+                config,
+                &job.id,
+                started_at,
+                finished_at,
+                status,
+                Some(&output),
+                duration_ms,
+            );
+        }
+    } else {
+        // insert_running_run failed — fall back to legacy record_run.
+        let status = if success { "ok" } else { "error" };
+        let _ = record_run(
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            Some(&output),
+            duration_ms,
+        );
+    }
+
+    let success =
+        persist_job_result_no_record(config, job, success, &output, started_at, finished_at).await;
     (job.id.clone(), success, output)
 }
 
@@ -181,14 +319,11 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
+        Ok(response) if response.trim().is_empty() => (
+            false,
+            "agent job produced no output (possible silent failure)".to_string(),
         ),
+        Ok(response) => (true, response),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
 }
@@ -250,8 +385,138 @@ async fn persist_job_result(
     success
 }
 
+/// Like [`persist_job_result`] but does NOT call `record_run` — used when the
+/// run row was already inserted/updated by the `insert_running_run` /
+/// `complete_run` path.
+async fn persist_job_result_no_record(
+    config: &Config,
+    job: &CronJob,
+    mut success: bool,
+    output: &str,
+    _started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+) -> bool {
+    if let Err(e) = deliver_if_configured(config, job, output).await {
+        if job.delivery.best_effort {
+            tracing::warn!("Cron delivery failed (best_effort): {e}");
+        } else {
+            success = false;
+            tracing::warn!("Cron delivery failed: {e}");
+        }
+    }
+
+    if is_one_shot_auto_delete(job) {
+        if success {
+            if let Err(e) = remove_job(config, &job.id) {
+                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
+            }
+        } else {
+            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            if let Err(e) = update_job(
+                config,
+                &job.id,
+                CronJobPatch {
+                    enabled: Some(false),
+                    ..CronJobPatch::default()
+                },
+            ) {
+                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+            }
+        }
+        return success;
+    }
+
+    if let Err(e) = reschedule_after_run(config, job, success, output) {
+        tracing::warn!("Failed to persist scheduler run result: {e}");
+    }
+
+    success
+}
+
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+}
+
+/// Sweep interrupted runs and log any jobs whose scheduled window was missed.
+///
+/// Called once at scheduler startup.  All operations are best-effort — errors
+/// are logged as warnings and do not prevent the scheduler from running.
+fn sweep_and_detect_on_startup(config: &Config) {
+    let now = Utc::now();
+
+    // 1. Mark any runs left in 'running' state as 'interrupted'.
+    match sweep_interrupted_runs(config) {
+        Ok(interrupted) => {
+            for (run_id, job_id, started_at) in &interrupted {
+                tracing::warn!(
+                    job_id,
+                    %started_at,
+                    "Found interrupted cron run from previous daemon shutdown"
+                );
+                if let Err(e) = mark_run_interrupted(config, *run_id, now) {
+                    tracing::warn!(job_id, "Failed to mark run as interrupted: {e}");
+                }
+            }
+            if !interrupted.is_empty() {
+                tracing::info!(count = interrupted.len(), "Swept interrupted cron runs");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to sweep interrupted cron runs: {e}");
+        }
+    }
+
+    // 2. Detect jobs that were due but never started (missed while daemon was down).
+    detect_missed_jobs(config, now);
+}
+
+/// Log a warning for each enabled job whose `next_run` is in the past by more
+/// than `scheduler.missed_job_grace_secs`.
+///
+/// This is informational only — the normal `due_jobs` poll will still pick up
+/// overdue jobs on the next tick.
+fn detect_missed_jobs(config: &Config, now: DateTime<Utc>) {
+    let grace_secs = config.scheduler.missed_job_grace_secs;
+
+    let jobs = match crate::cron::list_jobs(config) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("detect_missed_jobs: failed to list jobs: {e}");
+            return;
+        }
+    };
+
+    let mut missed = 0u32;
+    for job in &jobs {
+        if !job.enabled {
+            continue;
+        }
+        let overdue_secs = (now - job.next_run).num_seconds();
+        if overdue_secs <= 0 {
+            continue;
+        }
+
+        // Within grace period — normal scheduler will handle it shortly.
+        if grace_secs > 0 && u64::try_from(overdue_secs).unwrap_or(0) <= grace_secs {
+            continue;
+        }
+
+        let name = job.name.as_deref().unwrap_or(&job.id);
+        tracing::warn!(
+            job_id = %job.id,
+            job_name = name,
+            overdue_secs,
+            "Missed cron job detected at startup"
+        );
+        missed += 1;
+    }
+
+    if missed > 0 {
+        tracing::warn!(
+            missed,
+            "Missed cron jobs detected; they will be executed on the next scheduler tick"
+        );
+    }
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -765,7 +1030,14 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        process_due_jobs(
+            &config,
+            &security,
+            Vec::new(),
+            &component,
+            &mut JobCircuitBreaker::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -786,7 +1058,14 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job],
+            &component,
+            &mut JobCircuitBreaker::default(),
+        )
+        .await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];

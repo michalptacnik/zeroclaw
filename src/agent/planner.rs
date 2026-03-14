@@ -59,7 +59,10 @@ pub struct PlanningOutcome {
     pub path: PlanningPath,
 }
 
-fn route_model_for_hint(hint: &str, available_hints: &HashSet<String>) -> Option<String> {
+fn route_model_for_hint(
+    hint: &str,
+    available_hints: &HashSet<String, impl std::hash::BuildHasher>,
+) -> Option<String> {
     available_hints
         .contains(hint)
         .then(|| format!("hint:{hint}"))
@@ -141,7 +144,7 @@ pub async fn plan_execution(
     temperature: f64,
     query_classification: &QueryClassificationConfig,
     planner_config: &PlannerExecutionConfig,
-    available_hints: &HashSet<String>,
+    available_hints: &HashSet<String, impl std::hash::BuildHasher>,
 ) -> PlanningOutcome {
     let matched_hint = classifier::classify(query_classification, user_message)
         .filter(|hint| available_hints.contains(hint));

@@ -14,8 +14,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, due_jobs, get_job, list_jobs, list_runs, record_last_run, record_run,
-    remove_job, reschedule_after_run, update_job,
+    add_agent_job, complete_run, due_jobs, get_job, insert_running_run, list_jobs, list_runs,
+    mark_run_interrupted, record_last_run, record_run, remove_job, reschedule_after_run,
+    sweep_interrupted_runs, update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 

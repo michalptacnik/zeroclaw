@@ -14,12 +14,90 @@ pub struct ComponentHealth {
     pub restart_count: u64,
 }
 
+/// Health snapshot for a single provider as tracked by the circuit breaker.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHealth {
+    /// RFC3339 timestamp of the last successful call, or `null` if never succeeded.
+    pub last_success: Option<String>,
+    /// Number of consecutive failures since the last success.
+    pub consecutive_failures: u32,
+    /// Whether the provider is currently in the circuit-breaker cooldown period.
+    pub cooling_down: bool,
+    /// RFC3339 timestamp when the cooldown expires, or `null` if not cooling.
+    pub cooldown_until: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthSnapshot {
     pub pid: u32,
     pub updated_at: String,
     pub uptime_seconds: u64,
     pub components: BTreeMap<String, ComponentHealth>,
+    pub providers: BTreeMap<String, ProviderHealth>,
+}
+
+struct ProviderHealthRegistry {
+    providers: Mutex<BTreeMap<String, ProviderHealth>>,
+}
+
+static PROVIDER_REGISTRY: OnceLock<ProviderHealthRegistry> = OnceLock::new();
+
+fn provider_registry() -> &'static ProviderHealthRegistry {
+    PROVIDER_REGISTRY.get_or_init(|| ProviderHealthRegistry {
+        providers: Mutex::new(BTreeMap::new()),
+    })
+}
+
+/// Record a successful provider call.  Resets failure state.
+pub fn mark_provider_ok(provider_name: &str) {
+    let mut map = provider_registry().providers.lock();
+    let entry = map
+        .entry(provider_name.to_string())
+        .or_insert(ProviderHealth {
+            last_success: None,
+            consecutive_failures: 0,
+            cooling_down: false,
+            cooldown_until: None,
+        });
+    entry.last_success = Some(now_rfc3339());
+    entry.consecutive_failures = 0;
+    entry.cooling_down = false;
+    entry.cooldown_until = None;
+}
+
+/// Record a provider failure with the current consecutive failure count.
+pub fn mark_provider_failure(provider_name: &str, consecutive: u32) {
+    let mut map = provider_registry().providers.lock();
+    let entry = map
+        .entry(provider_name.to_string())
+        .or_insert(ProviderHealth {
+            last_success: None,
+            consecutive_failures: 0,
+            cooling_down: false,
+            cooldown_until: None,
+        });
+    entry.consecutive_failures = consecutive;
+}
+
+/// Record that a provider has entered circuit-breaker cooldown.
+pub fn mark_provider_cooling(provider_name: &str, until_rfc3339: &str, consecutive: u32) {
+    let mut map = provider_registry().providers.lock();
+    let entry = map
+        .entry(provider_name.to_string())
+        .or_insert(ProviderHealth {
+            last_success: None,
+            consecutive_failures: 0,
+            cooling_down: false,
+            cooldown_until: None,
+        });
+    entry.consecutive_failures = consecutive;
+    entry.cooling_down = true;
+    entry.cooldown_until = Some(until_rfc3339.to_string());
+}
+
+/// Snapshot the current provider health state.
+pub fn provider_health_snapshot() -> BTreeMap<String, ProviderHealth> {
+    provider_registry().providers.lock().clone()
 }
 
 struct HealthRegistry {
@@ -84,12 +162,14 @@ pub fn bump_component_restart(component: &str) {
 
 pub fn snapshot() -> HealthSnapshot {
     let components = registry().components.lock().clone();
+    let providers = provider_health_snapshot();
 
     HealthSnapshot {
         pid: std::process::id(),
         updated_at: now_rfc3339(),
         uptime_seconds: registry().started_at.elapsed().as_secs(),
         components,
+        providers,
     }
 }
 

@@ -1,3 +1,6 @@
+pub mod pid;
+pub mod preflight;
+
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
@@ -5,6 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -37,6 +41,14 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+    // Acquire PID file to prevent concurrent daemon instances.
+    let pid_path = config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("zeroclaw.pid");
+    let _pid_guard = pid::PidFileGuard::acquire(pid_path).await?;
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -45,21 +57,30 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    // Best-effort preflight checks — warnings only, never block startup.
+    preflight::run_preflight_checks(&config);
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
                 .await;
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let shutdown_token = CancellationToken::new();
+    let drain_secs = config.daemon.shutdown_drain_secs.max(1);
+
+    let mut handles: Vec<JoinHandle<()>> =
+        vec![spawn_state_writer(config.clone(), shutdown_token.clone())];
 
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
-        handles.push(spawn_component_supervisor(
+        let token = shutdown_token.clone();
+        handles.push(spawn_component_supervisor_cancellable(
             "gateway",
             initial_backoff,
             max_backoff,
+            token,
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
@@ -71,10 +92,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
-            handles.push(spawn_component_supervisor(
+            let token = shutdown_token.clone();
+            handles.push(spawn_component_supervisor_cancellable(
                 "channels",
                 initial_backoff,
                 max_backoff,
+                token,
                 move || {
                     let cfg = channels_cfg.clone();
                     async move { crate::channels::start_channels(cfg).await }
@@ -88,10 +111,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
+        let token = shutdown_token.clone();
+        handles.push(spawn_component_supervisor_cancellable(
             "heartbeat",
             initial_backoff,
             max_backoff,
+            token,
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -101,10 +126,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
+        let token = shutdown_token.clone();
+        handles.push(spawn_component_supervisor_cancellable(
             "scheduler",
             initial_backoff,
             max_backoff,
+            token,
             move || {
                 let cfg = scheduler_cfg.clone();
                 async move { crate::cron::scheduler::run(cfg).await }
@@ -124,11 +151,24 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     wait_for_shutdown_signal().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
 
-    for handle in &handles {
-        handle.abort();
-    }
-    for handle in handles {
-        let _ = handle.await;
+    // Signal all supervised components to stop and give them time to drain.
+    tracing::info!(drain_secs, "Shutdown requested — draining components");
+    shutdown_token.cancel();
+
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+
+    if tokio::time::timeout(Duration::from_secs(drain_secs), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            drain_secs,
+            "Drain timeout exceeded — some components may not have shut down cleanly"
+        );
     }
 
     Ok(())
@@ -142,7 +182,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
-fn spawn_state_writer(config: Config) -> JoinHandle<()> {
+fn spawn_state_writer(config: Config, shutdown_token: CancellationToken) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
@@ -151,16 +191,32 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
 
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
-            interval.tick().await;
-            let mut json = crate::health::snapshot_json();
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "written_at".into(),
-                    serde_json::json!(Utc::now().to_rfc3339()),
-                );
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut json = crate::health::snapshot_json();
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.insert(
+                            "written_at".into(),
+                            serde_json::json!(Utc::now().to_rfc3339()),
+                        );
+                    }
+                    let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
+                    let _ = tokio::fs::write(&path, data).await;
+                }
+                () = shutdown_token.cancelled() => {
+                    // Write a final snapshot before exiting.
+                    let mut json = crate::health::snapshot_json();
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.insert(
+                            "written_at".into(),
+                            serde_json::json!(Utc::now().to_rfc3339()),
+                        );
+                    }
+                    let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
+                    let _ = tokio::fs::write(&path, data).await;
+                    break;
+                }
             }
-            let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
-            let _ = tokio::fs::write(&path, data).await;
         }
     })
 }
@@ -197,6 +253,72 @@ where
             crate::health::bump_component_restart(name);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+    })
+}
+
+/// Like `spawn_component_supervisor` but exits the restart loop when
+/// `shutdown_token` is cancelled.  The in-flight component future is
+/// allowed to complete naturally; the cancellation only prevents the next
+/// restart iteration.
+fn spawn_component_supervisor_cancellable<F, Fut>(
+    name: &'static str,
+    initial_backoff_secs: u64,
+    max_backoff_secs: u64,
+    shutdown_token: CancellationToken,
+    mut run_component: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff = initial_backoff_secs.max(1);
+        let max_backoff = max_backoff_secs.max(backoff);
+
+        loop {
+            crate::health::mark_component_ok(name);
+
+            // Run the component and race it against a shutdown signal.
+            let result = tokio::select! {
+                r = run_component() => r,
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!("Daemon component '{name}' supervisor exiting due to shutdown");
+                    return;
+                }
+            };
+
+            // If shutdown was requested during the run we still exit cleanly.
+            if shutdown_token.is_cancelled() {
+                return;
+            }
+
+            match result {
+                Ok(()) => {
+                    crate::health::mark_component_error(name, "component exited unexpectedly");
+                    tracing::warn!("Daemon component '{name}' exited unexpectedly");
+                    backoff = initial_backoff_secs.max(1);
+                }
+                Err(e) => {
+                    crate::health::mark_component_error(name, e.to_string());
+                    tracing::error!("Daemon component '{name}' failed: {e}");
+                }
+            }
+
+            crate::health::bump_component_restart(name);
+
+            // Wait for backoff or shutdown — whichever comes first.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                () = shutdown_token.cancelled() => {
+                    tracing::debug!(
+                        "Daemon component '{name}' supervisor aborting backoff due to shutdown"
+                    );
+                    return;
+                }
+            }
+
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
