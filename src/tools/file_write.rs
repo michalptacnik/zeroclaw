@@ -58,7 +58,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                metadata: None,
             });
         }
 
@@ -67,7 +66,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                metadata: None,
             });
         }
 
@@ -77,7 +75,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path not allowed by security policy: {path}")),
-                metadata: None,
             });
         }
 
@@ -88,7 +85,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Invalid path: missing parent directory".into()),
-                metadata: None,
             });
         };
 
@@ -103,7 +99,6 @@ impl Tool for FileWriteTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
-                    metadata: None,
                 });
             }
         };
@@ -116,7 +111,6 @@ impl Tool for FileWriteTool {
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
                 ),
-                metadata: None,
             });
         }
 
@@ -125,7 +119,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Invalid path: missing file name".into()),
-                metadata: None,
             });
         };
 
@@ -141,7 +134,6 @@ impl Tool for FileWriteTool {
                         "Refusing to write through symlink: {}",
                         resolved_target.display()
                     )),
-                    metadata: None,
                 });
             }
         }
@@ -151,7 +143,6 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
-                metadata: None,
             });
         }
 
@@ -160,13 +151,11 @@ impl Tool for FileWriteTool {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
                 error: None,
-                metadata: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to write file: {e}")),
-                metadata: None,
             }),
         }
     }

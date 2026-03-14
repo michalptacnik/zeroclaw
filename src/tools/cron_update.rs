@@ -24,7 +24,6 @@ impl CronUpdateTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
-                metadata: None,
             });
         }
 
@@ -33,7 +32,6 @@ impl CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-                metadata: None,
             });
         }
 
@@ -42,7 +40,6 @@ impl CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-                metadata: None,
             });
         }
 
@@ -82,7 +79,6 @@ impl Tool for CronUpdateTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                metadata: None,
             });
         }
 
@@ -93,7 +89,6 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'job_id' parameter".to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -105,7 +100,6 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'patch' parameter".to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -117,7 +111,6 @@ impl Tool for CronUpdateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid patch payload: {e}")),
-                    metadata: None,
                 });
             }
         };
@@ -135,13 +128,11 @@ impl Tool for CronUpdateTool {
                 success: true,
                 output: serde_json::to_string_pretty(&job)?,
                 error: None,
-                metadata: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
-                metadata: None,
             }),
         }
     }

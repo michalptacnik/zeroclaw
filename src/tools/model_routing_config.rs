@@ -46,7 +46,6 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                metadata: None,
             });
         }
 
@@ -55,7 +54,6 @@ impl ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                metadata: None,
             });
         }
 
@@ -328,7 +326,6 @@ impl ModelRoutingConfigTool {
             success: true,
             output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -374,7 +371,6 @@ impl ModelRoutingConfigTool {
                 }
             }))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -427,7 +423,6 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -561,7 +556,6 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -607,7 +601,6 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -718,7 +711,6 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            metadata: None,
         })
     }
 
@@ -740,7 +732,6 @@ impl ModelRoutingConfigTool {
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
-            metadata: None,
         })
     }
 }
@@ -901,7 +892,6 @@ impl Tool for ModelRoutingConfigTool {
                 success: false,
                 output: String::new(),
                 error: Some(error.to_string()),
-                metadata: None,
             }),
         }
     }

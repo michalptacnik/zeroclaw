@@ -95,7 +95,7 @@ pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
-pub use traits::{ProofArtifact, ToolResult, ToolResultMetadata, ToolSpec};
+pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -241,11 +241,11 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Arc::new(MailTool::new(
-            security.clone(),
-            root_config.channels_config.email.clone(),
-        )),
     ];
+
+    if let Some(email_config) = root_config.channels_config.email.clone() {
+        tool_arcs.push(Arc::new(MailTool::new(email_config)));
+    }
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -291,6 +291,10 @@ pub fn all_tools_with_runtime(
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
         )));
+    }
+
+    if let Some(email_config) = root_config.channels_config.email.clone() {
+        tool_arcs.push(Arc::new(MailTool::new(email_config)));
     }
 
     // Web search tool (enabled by default for GLM and other models)
@@ -524,7 +528,6 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
-            metadata: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -539,7 +542,6 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
-            metadata: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

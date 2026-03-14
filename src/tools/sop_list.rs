@@ -55,7 +55,6 @@ impl Tool for SopListTool {
                 success: true,
                 output: "No SOPs loaded.".into(),
                 error: None,
-            metadata: None,
             });
         }
 
@@ -75,7 +74,6 @@ impl Tool for SopListTool {
                 success: true,
                 output: format!("No SOPs match filter '{filter}'."),
                 error: None,
-            metadata: None,
             });
         }
 
@@ -113,7 +111,6 @@ impl Tool for SopListTool {
             success: true,
             output,
             error: None,
-        metadata: None,
         })
     }
 }

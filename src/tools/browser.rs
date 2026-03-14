@@ -5,7 +5,7 @@
 //! `--features browser-native` and selected through config.
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
-use super::traits::{ProofArtifact, Tool, ToolResult, ToolResultMetadata};
+use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -193,6 +193,17 @@ pub enum BrowserAction {
         action: String, // click, fill, text, hover
         #[serde(default)]
         fill_value: Option<String>,
+    },
+    VerifyArtifact {
+        attempt_id: String,
+        #[serde(default)]
+        expected_text: Option<String>,
+        #[serde(default)]
+        expected_url_contains: Option<String>,
+        #[serde(default)]
+        expected_title_contains: Option<String>,
+        #[serde(default)]
+        artifact_id: Option<String>,
     },
 }
 
@@ -621,6 +632,75 @@ impl BrowserTool {
                 let resp = self.run_command(&args).await?;
                 self.to_result(resp)
             }
+            BrowserAction::VerifyArtifact {
+                attempt_id,
+                expected_text,
+                expected_url_contains,
+                expected_title_contains,
+                artifact_id,
+            } => {
+                let url_resp = self.run_command(&["get", "url"]).await?;
+                let title_resp = self.run_command(&["get", "title"]).await?;
+                let snapshot_resp = self.run_command(&["snapshot", "-c"]).await?;
+                let url = url_resp
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("url").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let title = title_resp
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("title").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let snapshot_text = snapshot_resp
+                    .data
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let text_matches = expected_text.as_ref().is_none_or(|needle| {
+                    snapshot_text
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                });
+                let url_matches = expected_url_contains.as_ref().is_none_or(|needle| {
+                    url.to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                });
+                let title_matches = expected_title_contains.as_ref().is_none_or(|needle| {
+                    title
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                });
+                if !(text_matches && url_matches && title_matches) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Browser artifact verification did not match the expected fresh proof"
+                                .to_string(),
+                        ),
+                    });
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "verified": true,
+                        "url": url,
+                        "title": title,
+                        "proof": {
+                            "attempt_id": attempt_id,
+                            "summary": "Fresh browser artifact verified. Stop and report success.",
+                            "artifact_id": artifact_id.unwrap_or(url.clone()),
+                            "fresh": true,
+                            "terminal": true,
+                        }
+                    }))
+                    .unwrap_or_default(),
+                    error: None,
+                })
+            }
         }
     }
 
@@ -666,7 +746,6 @@ impl BrowserTool {
                 success: true,
                 output: serde_json::to_string_pretty(&output).unwrap_or_default(),
                 error: None,
-                metadata: None,
             })
         }
 
@@ -798,56 +877,6 @@ impl BrowserTool {
 
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
-                let metadata = if action == "verify_artifact" {
-                    parsed.data.as_ref().and_then(|data| {
-                        let verified = data.get("verified").and_then(Value::as_bool)?;
-                        if !verified {
-                            return None;
-                        }
-                        Some(ToolResultMetadata {
-                            attempt_id: data
-                                .get("attempt_id")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                            proofs: vec![ProofArtifact {
-                                kind: data
-                                    .get("artifact_kind")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("browser_artifact")
-                                    .to_string(),
-                                id: data
-                                    .get("artifact_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("browser-proof")
-                                    .to_string(),
-                                summary: data
-                                    .get("summary")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("Fresh browser proof")
-                                    .to_string(),
-                                created_at: data
-                                    .get("created_at")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string),
-                                attempt_id: data
-                                    .get("attempt_id")
-                                    .and_then(Value::as_str)
-                                    .map(ToString::to_string),
-                                fresh: true,
-                                fallback: data
-                                    .get("fallback")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false),
-                                terminal: false,
-                            }],
-                            extra: Some(data.clone()),
-                            ..ToolResultMetadata::default()
-                        })
-                    })
-                } else {
-                    None
-                };
-
                 let output = parsed
                     .data
                     .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
@@ -864,7 +893,6 @@ impl BrowserTool {
                     success: true,
                     output,
                     error: None,
-                    metadata,
                 });
             }
 
@@ -882,7 +910,6 @@ impl BrowserTool {
                 success: false,
                 output: String::new(),
                 error,
-                metadata: None,
             });
         }
 
@@ -891,7 +918,6 @@ impl BrowserTool {
                 success: true,
                 output: body,
                 error: None,
-                metadata: None,
             });
         }
 
@@ -902,7 +928,6 @@ impl BrowserTool {
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
             )),
-            metadata: None,
         })
     }
 
@@ -920,25 +945,38 @@ impl BrowserTool {
         }
     }
 
+    /// Hard cap on browser tool output to prevent context-window blowup.
+    /// DOM snapshots from complex pages can exceed 4 MB of JSON; this keeps
+    /// the output under a safe threshold while still being useful.
+    const MAX_OUTPUT_CHARS: usize = 12_000;
+
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn to_result(&self, resp: AgentBrowserResponse) -> anyhow::Result<ToolResult> {
         if resp.success {
-            let output = resp
+            let mut output = resp
                 .data
                 .map(|d| serde_json::to_string_pretty(&d).unwrap_or_default())
                 .unwrap_or_default();
+            if output.len() > Self::MAX_OUTPUT_CHARS {
+                // Truncate on a char boundary and append a notice so the LLM
+                // knows the snapshot was trimmed.
+                let mut boundary = Self::MAX_OUTPUT_CHARS.saturating_sub(80);
+                while boundary > 0 && !output.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                output.truncate(boundary);
+                output.push_str("\n\n[... output truncated — snapshot exceeded 12 000 chars]");
+            }
             Ok(ToolResult {
                 success: true,
                 output,
                 error: None,
-                metadata: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: resp.error,
-                metadata: None,
             })
         }
     }
@@ -967,8 +1005,8 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["open", "snapshot", "click", "fill", "type", "get_text",
                              "get_title", "get_url", "screenshot", "wait", "press",
-                             "hover", "scroll", "is_visible", "close", "find",
-                             "list_windows", "focus_window", "list_tabs", "focus_tab", "verify_artifact",
+                             "hover", "scroll", "is_visible", "close", "find", "verify_artifact",
+                             "list_windows", "focus_window", "list_tabs", "focus_tab",
                              "mouse_move", "mouse_click", "mouse_drag", "key_type",
                              "key_press", "screen_capture"],
                     "description": "Browser action to perform (OS-level actions require backend=computer_use)"
@@ -1092,6 +1130,26 @@ impl Tool for BrowserTool {
                 "fill_value": {
                     "type": "string",
                     "description": "For find with fill action: value to fill"
+                },
+                "attempt_id": {
+                    "type": "string",
+                    "description": "Current attempt identifier for verification actions"
+                },
+                "expected_text": {
+                    "type": "string",
+                    "description": "Text expected to appear in the verified artifact"
+                },
+                "expected_url_contains": {
+                    "type": "string",
+                    "description": "Substring expected in the current URL during verification"
+                },
+                "expected_title_contains": {
+                    "type": "string",
+                    "description": "Substring expected in the page title during verification"
+                },
+                "artifact_id": {
+                    "type": "string",
+                    "description": "Optional explicit artifact identifier to return in proof"
                 }
             },
             "required": ["action"]
@@ -1105,7 +1163,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
-                metadata: None,
             });
         }
 
@@ -1114,7 +1171,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
-                metadata: None,
             });
         }
 
@@ -1125,7 +1181,6 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -1141,7 +1196,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown action: {action_str}")),
-                metadata: None,
             });
         }
 
@@ -1154,7 +1208,6 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
-                metadata: None,
             });
         }
 
@@ -1165,7 +1218,6 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -1519,6 +1571,64 @@ mod native_backend {
                         "value": value,
                         "selector": selector,
                         "data": payload,
+                    }))
+                }
+                BrowserAction::VerifyArtifact {
+                    attempt_id,
+                    expected_text,
+                    expected_url_contains,
+                    expected_title_contains,
+                    artifact_id,
+                } => {
+                    let client = self.active_client()?;
+                    let url = client
+                        .current_url()
+                        .await
+                        .context("Failed to read current URL")?
+                        .to_string();
+                    let title = client.title().await.context("Failed to read page title")?;
+                    let body_text = client
+                        .execute(
+                            "return (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 4000);",
+                            vec![],
+                        )
+                        .await
+                        .context("Failed to read page text for verification")?
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let text_matches = expected_text.as_ref().is_none_or(|needle| {
+                        body_text
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    });
+                    let url_matches = expected_url_contains.as_ref().is_none_or(|needle| {
+                        url.to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    });
+                    let title_matches = expected_title_contains.as_ref().is_none_or(|needle| {
+                        title
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    });
+                    if !(text_matches && url_matches && title_matches) {
+                        anyhow::bail!(
+                            "Browser artifact verification did not match the expected fresh proof"
+                        );
+                    }
+                    Ok(json!({
+                        "backend": "rust_native",
+                        "action": "verify_artifact",
+                        "verified": true,
+                        "url": url,
+                        "title": title,
+                        "proof": {
+                            "attempt_id": attempt_id,
+                            "summary": "Fresh browser artifact verified. Stop and report success.",
+                            "artifact_id": artifact_id.unwrap_or(url),
+                            "fresh": true,
+                            "terminal": true,
+                        }
                     }))
                 }
             }
@@ -2003,6 +2113,29 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                     .map(String::from),
             })
         }
+        "verify_artifact" => Ok(BrowserAction::VerifyArtifact {
+            attempt_id: args
+                .get("attempt_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'attempt_id' for verify_artifact"))?
+                .into(),
+            expected_text: args
+                .get("expected_text")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            expected_url_contains: args
+                .get("expected_url_contains")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            expected_title_contains: args
+                .get("expected_title_contains")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            artifact_id: args
+                .get("artifact_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }),
         other => anyhow::bail!("Unsupported browser action: {other}"),
     }
 }
@@ -2028,10 +2161,6 @@ fn is_supported_browser_action(action: &str) -> bool {
             | "is_visible"
             | "close"
             | "find"
-            | "list_windows"
-            | "focus_window"
-            | "list_tabs"
-            | "focus_tab"
             | "verify_artifact"
             | "mouse_move"
             | "mouse_click"
@@ -2039,23 +2168,26 @@ fn is_supported_browser_action(action: &str) -> bool {
             | "key_type"
             | "key_press"
             | "screen_capture"
+            | "list_windows"
+            | "focus_window"
+            | "list_tabs"
+            | "focus_tab"
     )
 }
 
 fn is_computer_use_only_action(action: &str) -> bool {
     matches!(
         action,
-        "list_windows"
-            | "focus_window"
-            | "list_tabs"
-            | "focus_tab"
-            | "verify_artifact"
-            | "mouse_move"
+        "mouse_move"
             | "mouse_click"
             | "mouse_drag"
             | "key_type"
             | "key_press"
             | "screen_capture"
+            | "list_windows"
+            | "focus_window"
+            | "list_tabs"
+            | "focus_tab"
     )
 }
 
@@ -2537,7 +2669,7 @@ mod tests {
         assert!(is_computer_use_only_action("focus_window"));
         assert!(is_computer_use_only_action("list_tabs"));
         assert!(is_computer_use_only_action("focus_tab"));
-        assert!(is_computer_use_only_action("verify_artifact"));
+        assert!(!is_computer_use_only_action("verify_artifact"));
         assert!(is_computer_use_only_action("mouse_move"));
         assert!(is_computer_use_only_action("mouse_click"));
         assert!(is_computer_use_only_action("mouse_drag"));

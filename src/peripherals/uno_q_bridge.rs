@@ -68,14 +68,12 @@ impl Tool for UnoQGpioReadTool {
                         success: false,
                         output: resp.clone(),
                         error: Some(resp),
-                        metadata: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
                         output: resp,
                         error: None,
-                        metadata: None,
                     })
                 }
             }
@@ -83,7 +81,6 @@ impl Tool for UnoQGpioReadTool {
                 success: false,
                 output: format!("Bridge error: {}", e),
                 error: Some(e.to_string()),
-                metadata: None,
             }),
         }
     }
@@ -135,14 +132,12 @@ impl Tool for UnoQGpioWriteTool {
                         success: false,
                         output: resp.clone(),
                         error: Some(resp),
-                        metadata: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
                         output: "done".into(),
                         error: None,
-                        metadata: None,
                     })
                 }
             }
@@ -150,7 +145,6 @@ impl Tool for UnoQGpioWriteTool {
                 success: false,
                 output: format!("Bridge error: {}", e),
                 error: Some(e.to_string()),
-                metadata: None,
             }),
         }
     }

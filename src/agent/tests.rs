@@ -158,7 +158,6 @@ impl Tool for EchoTool {
             success: true,
             output: msg,
             error: None,
-            metadata: None,
         })
     }
 }
@@ -185,7 +184,6 @@ impl Tool for FailingTool {
             success: false,
             output: String::new(),
             error: Some("intentional failure".into()),
-            metadata: None,
         })
     }
 }
@@ -250,7 +248,6 @@ impl Tool for CountingTool {
             success: true,
             output: format!("call #{}", *c),
             error: None,
-            metadata: None,
         })
     }
 }
@@ -1166,14 +1163,14 @@ fn xml_format_results_includes_status_and_output() {
             output: "file1.txt\nfile2.txt".into(),
             success: true,
             tool_call_id: None,
-            metadata: None,
+            proof: None,
         },
         ToolExecutionResult {
             name: "file_read".into(),
             output: "Error: file not found".into(),
             success: false,
             tool_call_id: None,
-            metadata: None,
+            proof: None,
         },
     ];
 
@@ -1199,14 +1196,14 @@ fn native_format_results_maps_tool_call_ids() {
             output: "out1".into(),
             success: true,
             tool_call_id: Some("tc-001".into()),
-            metadata: None,
+            proof: None,
         },
         ToolExecutionResult {
             name: "b".into(),
             output: "out2".into(),
             success: true,
             tool_call_id: Some("tc-002".into()),
-            metadata: None,
+            proof: None,
         },
     ];
 

@@ -123,14 +123,12 @@ impl Tool for SopExecuteTool {
                     success: true,
                     output,
                     error: None,
-                metadata: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to start SOP: {e}")),
-            metadata: None,
             }),
         }
     }

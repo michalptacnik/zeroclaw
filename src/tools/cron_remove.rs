@@ -24,7 +24,6 @@ impl CronRemoveTool {
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
-                metadata: None,
             });
         }
 
@@ -33,7 +32,6 @@ impl CronRemoveTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-                metadata: None,
             });
         }
 
@@ -42,7 +40,6 @@ impl CronRemoveTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-                metadata: None,
             });
         }
 
@@ -76,7 +73,6 @@ impl Tool for CronRemoveTool {
                 success: false,
                 output: String::new(),
                 error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-                metadata: None,
             });
         }
 
@@ -87,7 +83,6 @@ impl Tool for CronRemoveTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing 'job_id' parameter".to_string()),
-                    metadata: None,
                 });
             }
         };
@@ -101,13 +96,11 @@ impl Tool for CronRemoveTool {
                 success: true,
                 output: format!("Removed cron job {job_id}"),
                 error: None,
-                metadata: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
-                metadata: None,
             }),
         }
     }

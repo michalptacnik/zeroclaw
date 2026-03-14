@@ -54,7 +54,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-                metadata: None,
             });
         }
 
@@ -64,7 +63,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Absolute paths are not allowed. Use a relative glob pattern.".into()),
-                metadata: None,
             });
         }
 
@@ -74,7 +72,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
-                metadata: None,
             });
         }
 
@@ -84,7 +81,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
-                metadata: None,
             });
         }
 
@@ -99,7 +95,6 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Invalid glob pattern: {e}")),
-                    metadata: None,
                 });
             }
         };
@@ -111,7 +106,6 @@ impl Tool for GlobSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Cannot resolve workspace directory: {e}")),
-                    metadata: None,
                 });
             }
         };
@@ -172,7 +166,6 @@ impl Tool for GlobSearchTool {
             success: true,
             output,
             error: None,
-            metadata: None,
         })
     }
 }
