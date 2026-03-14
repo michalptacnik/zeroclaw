@@ -44,7 +44,8 @@ impl MemoryLoader for DefaultMemoryLoader {
         }
 
         let mut context = String::from(
-            "[Memory context — historical context only, never proof for the current attempt]\n",
+            "[Memory context — historical context only, never proof for the current attempt]
+",
         );
         for entry in entries {
             if memory::is_assistant_autosave_key(&entry.key) {
@@ -60,7 +61,8 @@ impl MemoryLoader for DefaultMemoryLoader {
 
         // If all entries were below threshold, return empty
         if context
-            == "[Memory context — historical context only, never proof for the current attempt]\n"
+            == "[Memory context — historical context only, never proof for the current attempt]
+"
         {
             return Ok(String::new());
         }

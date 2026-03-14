@@ -3,7 +3,7 @@ use crate::config::{PlannerExecutionConfig, QueryClassificationConfig};
 use crate::providers::{ChatMessage, ChatRequest, Provider};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const PLANNER_SYSTEM_PROMPT: &str = r#"You are ZeroClaw's execution planner.
 
@@ -256,6 +256,13 @@ pub async fn plan_execution(
         brief: None,
         path: PlanningPath::Default,
     }
+}
+
+/// Build the set of available routing hints from a model-route map.
+pub fn available_hint_set(
+    route_model_by_hint: &HashMap<String, String, impl std::hash::BuildHasher>,
+) -> HashSet<String> {
+    route_model_by_hint.keys().cloned().collect()
 }
 
 #[cfg(test)]

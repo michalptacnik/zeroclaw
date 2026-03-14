@@ -293,6 +293,10 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    if let Some(email_config) = root_config.channels_config.email.clone() {
+        tool_arcs.push(Arc::new(MailTool::new(security.clone(), Some(email_config))));
+    }
+
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(

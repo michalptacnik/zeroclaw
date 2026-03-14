@@ -2,6 +2,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
+use crate::agent::planner;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -35,6 +36,7 @@ pub struct Agent {
     auto_save: bool,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
+    planner_execution_config: crate::config::PlannerExecutionConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
 }
@@ -56,6 +58,7 @@ pub struct AgentBuilder {
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
+    planner_execution_config: Option<crate::config::PlannerExecutionConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
 }
@@ -79,6 +82,7 @@ impl AgentBuilder {
             skills_prompt_mode: None,
             auto_save: None,
             classification_config: None,
+            planner_execution_config: None,
             available_hints: None,
             route_model_by_hint: None,
         }
@@ -170,6 +174,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn planner_execution_config(
+        mut self,
+        planner_execution_config: crate::config::PlannerExecutionConfig,
+    ) -> Self {
+        self.planner_execution_config = Some(planner_execution_config);
+        self
+    }
+
     pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
         self.available_hints = Some(available_hints);
         self
@@ -221,6 +233,7 @@ impl AgentBuilder {
             auto_save: self.auto_save.unwrap_or(false),
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
+            planner_execution_config: self.planner_execution_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
         })
@@ -333,6 +346,7 @@ impl Agent {
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
+            .planner_execution_config(config.planner_execution.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
@@ -389,7 +403,8 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name)
+        {
             match tool.execute(call.arguments.clone()).await {
                 Ok(r) => {
                     self.observer.record_event(&ObserverEvent::ToolCall {
@@ -500,6 +515,26 @@ impl Agent {
             .await
             .unwrap_or_default();
         let attempt_id = uuid::Uuid::new_v4().to_string();
+        let prior_chat_history: Vec<ChatMessage> = self
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) => Some(chat.clone()),
+                _ => None,
+            })
+            .collect();
+        let available_hint_set = planner::available_hint_set(&self.route_model_by_hint);
+        let planning = planner::plan_execution(
+            self.provider.as_ref(),
+            &prior_chat_history,
+            user_message,
+            &self.model_name,
+            self.temperature,
+            &self.classification_config,
+            &self.planner_execution_config,
+            &available_hint_set,
+        )
+        .await;
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
@@ -515,10 +550,17 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = planning.effective_model;
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            if let Some(extra_system_context) = planning.extra_system_context.as_deref() {
+                let insert_at = messages
+                    .iter()
+                    .take_while(|message| message.role == "system")
+                    .count();
+                messages.insert(insert_at, ChatMessage::system(extra_system_context));
+            }
             let response = match self
                 .provider
                 .chat(
@@ -572,6 +614,35 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+            if let Some(proof) = results.iter().find_map(|result| {
+                result
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.proofs.iter().find(|p| p.fresh && p.terminal))
+                    .filter(|artifact| {
+                        artifact
+                            .attempt_id
+                            .as_deref()
+                            .is_none_or(|proof_attempt_id| proof_attempt_id == attempt_id)
+                    })
+                    .map(|artifact| crate::agent::proof::ProofSignal {
+                        attempt_id: artifact.attempt_id.clone(),
+                        summary: Some(artifact.summary.clone()),
+                        artifact_id: Some(artifact.id.clone()),
+                        fresh: artifact.fresh,
+                        terminal: artifact.terminal,
+                    })
+            }) {
+                let final_text = crate::agent::proof::render_terminal_success_message(&proof);
+                let formatted = self.tool_dispatcher.format_results(&results);
+                self.history.push(formatted);
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                self.trim_history();
+                return Ok(final_text);
+            }
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
