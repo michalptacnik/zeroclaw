@@ -353,6 +353,8 @@ mod tests {
             &QueryClassificationConfig::default(),
             &PlannerExecutionConfig {
                 enabled: true,
+                planner_hint: "planner".to_string(),
+                executor_hint: "executor".to_string(),
                 ..PlannerExecutionConfig::default()
             },
             &HashSet::from(["planner".to_string(), "executor".to_string()]),
@@ -377,6 +379,8 @@ mod tests {
             &QueryClassificationConfig::default(),
             &PlannerExecutionConfig {
                 enabled: true,
+                planner_hint: "planner".to_string(),
+                executor_hint: "executor".to_string(),
                 ..PlannerExecutionConfig::default()
             },
             &HashSet::from(["executor".to_string()]),
